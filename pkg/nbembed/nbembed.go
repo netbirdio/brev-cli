@@ -45,21 +45,34 @@ func New(opts Options) (*Client, error) {
 
 // Start logs in to management and brings up the overlay.
 func (c *Client) Start(ctx context.Context) error {
-	return c.nb.Start(ctx)
+	if err := c.nb.Start(ctx); err != nil {
+		return fmt.Errorf("start embedded netbird client: %w", err)
+	}
+	return nil
 }
 
 // Stop tears the overlay down.
 func (c *Client) Stop(ctx context.Context) error {
-	return c.nb.Stop(ctx)
+	if err := c.nb.Stop(ctx); err != nil {
+		return fmt.Errorf("stop embedded netbird client: %w", err)
+	}
+	return nil
 }
 
 // Dial opens a TCP connection to an overlay address through the netstack.
 func (c *Client) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	return c.nb.Dial(ctx, "tcp", addr)
+	conn, err := c.nb.Dial(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s over netbird: %w", addr, err)
+	}
+	return conn, nil
 }
 
 // VerifySSHHostKey checks an SSH host key against the peer's key from the
 // network map.
 func (c *Client) VerifySSHHostKey(peerAddr string, key []byte) error {
-	return c.nb.VerifySSHHostKey(peerAddr, key)
+	if err := c.nb.VerifySSHHostKey(peerAddr, key); err != nil {
+		return fmt.Errorf("verify ssh host key for %s: %w", peerAddr, err)
+	}
+	return nil
 }

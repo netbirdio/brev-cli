@@ -56,7 +56,7 @@ func NewCmdNBProxy() *cobra.Command {
 func nbDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("user home dir: %w", err)
 	}
 	return filepath.Join(home, ".brev", "netbird"), nil
 }
@@ -127,7 +127,7 @@ func run(ctx context.Context, host string, port uint16) error {
 		return fmt.Errorf("dial %s over netbird: %w", target, err)
 	}
 
-	netrelay.Relay(ctx, &stdioConn{in: os.Stdin, out: os.Stdout}, conn, netrelay.Options{})
+	netrelay.Relay(ctx, &stdioConn{Reader: os.Stdin, Writer: os.Stdout}, conn, netrelay.Options{})
 	return nil
 }
 
@@ -147,11 +147,12 @@ func startBounded(ctx context.Context, nb *netbird.Client) error {
 	}
 }
 
+// stdioConn presents the process stdio as one closable stream for the relay.
+// Read and Write are promoted from the embedded fields so io.EOF reaches the
+// relay unwrapped.
 type stdioConn struct {
-	in  io.Reader
-	out io.Writer
+	io.Reader
+	io.Writer
 }
 
-func (s *stdioConn) Read(p []byte) (int, error)  { return s.in.Read(p) }
-func (s *stdioConn) Write(p []byte) (int, error) { return s.out.Write(p) }
-func (s *stdioConn) Close() error                { return nil }
+func (*stdioConn) Close() error { return nil }
