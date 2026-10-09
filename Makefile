@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := fast-build
 VERSION := dev-$(shell git rev-parse HEAD | cut -c 1-8)
 
-# Cross-compilation via Docker (golang:1.25 native Linux container).
+# Cross-compilation via Docker (golang:1.26.7 native Linux container).
 # When arch=<GOOS>/<GOARCH> is provided, spin up a container that matches
 # the target platform so CGO uses the native Linux gcc/GNU ld toolchain
 _GOMODCACHE := $(shell go env GOMODCACHE)
@@ -16,7 +16,7 @@ ifdef arch
     -e GOPRIVATE=github.com/brevdev/* \
     -e GONOSUMDB=github.com/brevdev/* \
     -w /app \
-    golang:1.25
+    golang:1.26.7
 else
   _BUILD_PREFIX := CGO_ENABLED=1
 endif
@@ -117,6 +117,10 @@ test: ## go test with race detector and code covarage
 	go test -race -covermode=atomic -coverprofile=coverage.out ./pkg/...
 	go tool cover -html=coverage.out -o coverage.html
 
+.PHONY: test-netbird
+test-netbird: ## test the embedded NetBird SSH pilot without production credentials
+	go test -race ./pkg/nbembed ./pkg/sshtransport ./pkg/cmd/nbagent ./pkg/cmd/nbproxy ./pkg/cmd/tunnel ./pkg/cmd/logout ./pkg/cmd/exec ./pkg/cmd/shell ./pkg/cmd/open ./pkg/cmd/util ./pkg/ssh ./pkg/cmd/refresh
+
 .PHONY: test-e2e
 test-e2e: ## go test with race detector and code covarage
 	$(call print-target)
@@ -144,7 +148,9 @@ release: install-tools
 # See: https://goreleaser.com/limitations/cgo (goreleaser needs explicit instructions for CGO builds)
 # See: https://github.com/goreleaser/goreleaser-cross (docker image with cross-compilers for CGO builds)
 # See: https://github.com/goreleaser/example-cross (example of using goreleaser-cross)
-GOLANG_CROSS_VERSION ?= v1.24.5
+GOLANG_CROSS_VERSION ?= v1.25.0
+# Keep the existing cross-compilers; download the module-compatible Go toolchain.
+GOTOOLCHAIN ?= go1.26.7
 BREV_MODULE ?= github.com/brevdev/brev-cli
 
 # Dry-run build using goreleaser-cross
@@ -153,6 +159,7 @@ build-cross:
 	$(call print-target)
 	docker run --rm \
 		-e CGO_ENABLED=1 \
+		-e GOTOOLCHAIN=$(GOTOOLCHAIN) \
 		-v "$$(pwd):/go/src/$(BREV_MODULE)" \
 		-w "/go/src/$(BREV_MODULE)" \
 		ghcr.io/goreleaser/goreleaser-cross:$(GOLANG_CROSS_VERSION) \
@@ -164,6 +171,7 @@ release-cross:
 	$(call print-target)
 	docker run --rm \
 		-e CGO_ENABLED=1 \
+		-e GOTOOLCHAIN=$(GOTOOLCHAIN) \
 		-e "GITHUB_TOKEN=$$GITHUB_TOKEN" \
 		-v "$$(pwd):/go/src/$(BREV_MODULE)" \
 		-w "/go/src/$(BREV_MODULE)" \
@@ -322,8 +330,8 @@ version-bump: fetch-tags
 	bump2version --current-version $(shell git describe --tags --abbrev=0) ${type} --list --tag --serialize v{major}.{minor}.{patch} --tag-name {new_version}  | grep new_version | sed -r s,"^.*=",, | xargs git push origin
 
 
-lr := $(shell git rev-parse latest-review)
-cr := $(shell git rev-parse main)
+lr = $(shell git rev-parse latest-review)
+cr = $(shell git rev-parse main)
 
 review:
 	git diff ${lr}...${cr}

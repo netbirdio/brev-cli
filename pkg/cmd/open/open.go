@@ -22,6 +22,7 @@ import (
 	"github.com/brevdev/brev-cli/pkg/entity"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
 	"github.com/brevdev/brev-cli/pkg/files"
+	"github.com/brevdev/brev-cli/pkg/sshtransport"
 	"github.com/brevdev/brev-cli/pkg/store"
 	"github.com/brevdev/brev-cli/pkg/terminal"
 	uutil "github.com/brevdev/brev-cli/pkg/util"
@@ -628,7 +629,8 @@ func openEditorWithSSH(
 func waitForSSHToBeAvailable(t *terminal.Terminal, s *spinner.Spinner, sshAlias string) error {
 	counter := 0
 	for {
-		cmd := exec.Command("ssh", "-o", "ConnectTimeout=3", sshAlias, "echo", " ")
+		timeout := sshtransport.ConnectTimeout(sshAlias, 3)
+		cmd := exec.Command("ssh", "-o", fmt.Sprintf("ConnectTimeout=%d", timeout), sshAlias, "echo", " ")
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil

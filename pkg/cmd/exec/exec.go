@@ -13,6 +13,7 @@ import (
 	"github.com/brevdev/brev-cli/pkg/cmd/util"
 	"github.com/brevdev/brev-cli/pkg/entity"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/sshtransport"
 	"github.com/brevdev/brev-cli/pkg/store"
 	"github.com/brevdev/brev-cli/pkg/terminal"
 	"github.com/hashicorp/go-multierror"
@@ -21,6 +22,8 @@ import (
 )
 
 var (
+	isPilotTarget = sshtransport.IsConfigured
+
 	execLong    = "Execute a command on one or more instances non-interactively"
 	execExample = `  # Run a command on an instance
   brev exec my-instance "nvidia-smi"
@@ -192,6 +195,11 @@ func runExecCommand(t *terminal.Terminal, sstore ExecStore, workspaceNameOrID st
 		go trackExecAnalytics(sstore, workspaceNameOrID)
 		return nil
 	}
+	// A failed remote command may already have changed the target. The pilot
+	// never retries the command or switches transport after SSH starts.
+	if isPilotTarget(sshName) {
+		return breverrors.WrapAndTrace(err)
+	}
 
 	// SSH failed — now check what's going on with the instance
 	fmt.Fprintf(os.Stderr, "Connection failed, checking instance status...\n")
@@ -257,6 +265,7 @@ func trackExecAnalytics(sstore ExecStore, workspaceNameOrID string) {
 }
 
 func runSSHWithTimeout(sshAlias string, command string, connectTimeoutSecs int) error {
+	connectTimeoutSecs = sshtransport.ConnectTimeout(sshAlias, connectTimeoutSecs)
 	// Non-interactive: run command and pipe stdout/stderr
 	// Escape the command for passing to SSH
 	escapedCmd := strings.ReplaceAll(command, "'", "'\\''")

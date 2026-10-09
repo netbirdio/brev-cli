@@ -10,6 +10,7 @@ import (
 
 	"github.com/brevdev/brev-cli/pkg/entity"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/sshtransport"
 	"github.com/brevdev/brev-cli/pkg/store"
 	"github.com/briandowns/spinner"
 )
@@ -49,11 +50,16 @@ func WaitForSSHToBeAvailable(sshAlias string, s *spinner.Spinner, refreshConfig 
 	s.Suffix = " waiting for SSH connection to be available"
 	s.Start()
 	defer s.Stop()
+	connectTimeout := sshtransport.ConnectTimeout(sshAlias, sshAvailabilityConnectTimeoutSeconds)
+	attemptTimeout := sshAvailabilityAttemptTimeout
+	if connectTimeout > sshAvailabilityConnectTimeoutSeconds {
+		attemptTimeout = time.Duration(connectTimeout+2) * time.Second
+	}
 	for attempt := 1; ; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), sshAvailabilityAttemptTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
 		cmd := exec.CommandContext(ctx, "ssh",
 			"-T",
-			"-o", fmt.Sprintf("ConnectTimeout=%d", sshAvailabilityConnectTimeoutSeconds),
+			"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout),
 			"-o", "ConnectionAttempts=1",
 			"-o", "BatchMode=yes",
 			"-o", "NumberOfPasswordPrompts=0",
@@ -72,12 +78,15 @@ func WaitForSSHToBeAvailable(sshAlias string, s *spinner.Spinner, refreshConfig 
 
 		stdErr := strings.TrimSpace(string(out))
 		if timedOut {
-			stdErr = fmt.Sprintf("SSH attempt %d timed out after %s", attempt, sshAvailabilityAttemptTimeout)
+			stdErr = fmt.Sprintf("SSH attempt %d timed out after %s", attempt, attemptTimeout)
 		} else if stdErr == "" {
 			stdErr = err.Error()
 		}
 
 		aliasUnresolved := sshAliasUnresolved(stdErr)
+		if sshtransport.IsConfigured(sshAlias) {
+			return breverrors.NewValidationError("\n" + stdErr)
+		}
 		// A failure that will not resolve by waiting (bad credentials, host key
 		// mismatch) fails immediately. It is expected, so print it cleanly
 		// rather than dumping a stack trace.

@@ -18,6 +18,7 @@ import (
 	"github.com/brevdev/brev-cli/pkg/cmd/util"
 	"github.com/brevdev/brev-cli/pkg/entity"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/sshtransport"
 	"github.com/brevdev/brev-cli/pkg/store"
 	"github.com/brevdev/brev-cli/pkg/terminal"
 	"github.com/spf13/cobra"
@@ -106,6 +107,9 @@ func runShellCommand(t *terminal.Terminal, sstore ShellStore, workspaceNameOrID 
 		trackShellAnalytics(sstore, workspace)
 		return nil
 	}
+	if sshtransport.IsConfigured(sshName) {
+		return breverrors.WrapAndTrace(err)
+	}
 	_, _ = fmt.Fprintln(os.Stderr, "\nConnection failed, refreshing SSH config and retrying...")
 
 	refreshRes := refresh.RunRefreshAsync(sstore)
@@ -166,6 +170,9 @@ func shellIntoExternalNode(sstore ShellStore, node *nodev1.ExternalNode) error {
 	if err == nil {
 		return nil
 	}
+	if sshtransport.IsConfigured(alias) {
+		return breverrors.WrapAndTrace(err)
+	}
 
 	_, _ = fmt.Fprintln(os.Stderr, "\nConnection failed, refreshing SSH config and retrying...")
 	refreshRes := refresh.RunRefreshAsync(sstore)
@@ -182,12 +189,13 @@ func runSSH(sshAlias string, host bool) error {
 
 func runSSHWithOptions(sshAlias string, host bool, printFailureAdvice bool) error {
 	sshAgentEval := `if [ -z "$SSH_AUTH_SOCK" ]; then eval $(ssh-agent -s) > /dev/null; fi`
+	connectTimeout := sshtransport.ConnectTimeout(sshAlias, 5)
 	var cmd string
 	if host {
-		cmd = fmt.Sprintf("%s && ssh -o ConnectTimeout=5 %s", sshAgentEval, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh -o ConnectTimeout=%d %s", sshAgentEval, connectTimeout, sshAlias)
 	} else {
 		// SSH into VM and respect container WORKDIR if containerized, otherwise use default directory
-		cmd = fmt.Sprintf("%s && ssh -t -o ConnectTimeout=5 %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh -t -o ConnectTimeout=%d %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, connectTimeout, sshAlias)
 	}
 
 	var stderrBuf bytes.Buffer

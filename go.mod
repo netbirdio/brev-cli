@@ -1,6 +1,8 @@
 module github.com/brevdev/brev-cli
 
-go 1.25.0
+go 1.26.0
+
+toolchain go1.26.7
 
 require (
 	buf.build/gen/go/brevdev/devplane/connectrpc/go v1.21.0-20260915224432-6a5d0c858507.1
@@ -27,6 +29,7 @@ require (
 	github.com/jinzhu/copier v0.4.0
 	github.com/kevinburke/ssh_config v1.2.0
 	github.com/manifoldco/promptui v0.9.0
+	github.com/netbirdio/netbird v0.81.0-canary.pr-8098.1.0.20261008142856-01d828d732e3
 	github.com/pkg/browser v0.0.0-20210911075715-681adbf594b8
 	github.com/pkg/errors v0.9.1
 	github.com/posthog/posthog-go v1.10.0
@@ -112,6 +115,7 @@ require (
 )
 
 require (
+	cloud.google.com/go v0.123.0
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/go-errors/errors v1.4.2 // indirect
@@ -152,6 +156,7 @@ require (
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
+	google.golang.org/genproto v0.0.0-20260401024825-9d38bb4040a9
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
@@ -165,3 +170,14 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
+
+// NetBird requires its WireGuard, ICE and Rosenpass-compatible CIRCL forks.
+replace golang.zx2c4.com/wireguard => github.com/netbirdio/wireguard-go v0.0.0-20260914123147-8bf8fa968f1a
+
+replace github.com/pion/ice/v4 => github.com/netbirdio/ice/v4 v4.0.0-20250908184934-6202be846b51
+
+replace github.com/cloudflare/circl => codeberg.org/cunicu/circl v0.0.0-20230801113412-fec58fc7b5f6
+
+replace github.com/dexidp/dex => github.com/netbirdio/dex v0.244.1-0.20260716205454-a163de3129e5
+
+replace github.com/dexidp/dex/api/v2 => github.com/netbirdio/dex/api/v2 v2.0.0-20260512110716-8d70ad8647c1
