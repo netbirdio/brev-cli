@@ -36,6 +36,7 @@ import (
 	"github.com/brevdev/brev-cli/pkg/cmd/logout"
 	"github.com/brevdev/brev-cli/pkg/cmd/ls"
 	"github.com/brevdev/brev-cli/pkg/cmd/mintcert"
+	"github.com/brevdev/brev-cli/pkg/cmd/nbproxy"
 	"github.com/brevdev/brev-cli/pkg/cmd/notebook"
 	"github.com/brevdev/brev-cli/pkg/cmd/ollama"
 	"github.com/brevdev/brev-cli/pkg/cmd/open"
@@ -366,6 +367,7 @@ func createCmdTree(cmd *cobra.Command, t *terminal.Terminal, loginCmdStore *stor
 	cmd.AddCommand(background.NewCmdBackground(t, loginCmdStore))
 	cmd.AddCommand(status.NewCmdStatus(t, loginCmdStore))
 	cmd.AddCommand(sshkeys.NewCmdSSHKeys(t, loginCmdStore))
+	cmd.AddCommand(nbproxy.NewCmdNBProxy())
 	cmd.AddCommand(start.NewCmdStart(t, loginCmdStore, noLoginCmdStore))
 	cmd.AddCommand(stop.NewCmdStop(t, loginCmdStore, noLoginCmdStore))
 	cmd.AddCommand(delete.NewCmdDelete(t, loginCmdStore, noLoginCmdStore))
