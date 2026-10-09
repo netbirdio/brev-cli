@@ -1,6 +1,11 @@
 // Package nbproxy implements the hidden `brev nb-proxy <host> <port>` command
 // used as an OpenSSH ProxyCommand: it brings up an embedded NetBird peer in
 // netstack mode, dials host:port over the overlay and relays stdin/stdout.
+//
+// Prototype only. One engine per ProxyCommand with a persisted setup key is
+// the shape docs/netbird-ssh/ux-options.md rules out for shipping; the
+// recommended design moves the peer into a per-user helper with a one-off
+// enrollment credential.
 package nbproxy
 
 import (
