@@ -52,6 +52,9 @@ var (
 	// ErrIdentityRejected means management no longer accepts this device's key,
 	// usually because the device was removed from Brev.
 	ErrIdentityRejected = errors.New("this device's tunnel identity is no longer known to Brev; run 'brev deregister' and then 'brev register --embedded' again")
+	// ErrSetupKeyRejected means management refused the setup key Brev handed
+	// out, for example because it was already used or has expired.
+	ErrSetupKeyRejected = errors.New("Brev's tunnel setup key was refused; run 'brev deregister' and then 'brev register --embedded' again to get a new one")
 )
 
 // Dir returns the directory holding the embedded tunnel identity for userHome.
@@ -84,6 +87,17 @@ func Remove(dir string) error {
 	return nil
 }
 
+// CheckAvailable reports ErrLocked when another process is running the
+// identity under dir, so a caller can fail fast before spawning ssh.
+func CheckAvailable(dir string) error {
+	unlock, err := lock(dir)
+	if err != nil {
+		return err
+	}
+	unlock()
+	return nil
+}
+
 // Register enrolls the device by logging in to management once with the setup
 // key, then stops the client and persists the identity. The setup key itself is
 // never written to disk; later sessions log in with the persisted private key.
@@ -103,6 +117,12 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 	}
 	defer sess.close()
 
+	// The identity file marks a completed enrollment and is rewritten below;
+	// without this a failed retry would leave it beside a key management never
+	// accepted, and IsRegistered would report the device as enrolled.
+	if err := os.Remove(filepath.Join(dir, identityFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale %s: %w", identityFile, err)
+	}
 	if err := discardForeignIdentity(dir, creds.ManagementURL); err != nil {
 		return err
 	}
@@ -118,7 +138,7 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 	if err := checkManagementURL(client, creds.ManagementURL); err != nil {
 		return err
 	}
-	if err := startBounded(ctx, client); err != nil {
+	if err := startBounded(ctx, client, ErrSetupKeyRejected); err != nil {
 		return err
 	}
 	stopClient(client)
@@ -131,10 +151,15 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 }
 
 // discardForeignIdentity removes a persisted key and state that belong to
-// another management server, so the setup key enrolls a fresh peer there.
+// another management server, so the setup key enrolls a fresh peer there. A
+// config that cannot be read back is discarded too, since every later start
+// would fail on it.
 func discardForeignIdentity(dir, managementURL string) error {
 	existing, err := readConfigManagementURL(dir)
-	if err != nil || existing == "" || sameManagementURL(existing, managementURL) {
+	if errors.Is(err, ErrNotRegistered) {
+		return nil
+	}
+	if err == nil && (existing == "" || sameManagementURL(existing, managementURL)) {
 		return nil
 	}
 	for _, name := range []string{identityFile, configFile, stateFile} {
@@ -208,7 +233,7 @@ func (t *Tunnel) LogPath() string {
 
 // Start logs in to management and brings the overlay up.
 func (t *Tunnel) Start(ctx context.Context) error {
-	if err := startBounded(ctx, t.client); err != nil {
+	if err := startBounded(ctx, t.client, ErrIdentityRejected); err != nil {
 		return err
 	}
 	t.mu.Lock()
@@ -413,8 +438,10 @@ func canonicalURL(raw string) string {
 // startBounded wraps Start with a deadline of its own, because embed.Start
 // only honors ctx once the management login has completed. On a timeout the
 // orphaned Start is given a short grace to return before the caller tears the
-// log and lock down underneath it.
-func startBounded(ctx context.Context, client *netbird.Client) error {
+// log and lock down underneath it; a refusal that lands in that window is
+// still reported as such. refusal names what a management refusal means for
+// the credential in use.
+func startBounded(ctx context.Context, client *netbird.Client, refusal error) error {
 	ctx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
 
@@ -424,7 +451,7 @@ func startBounded(ctx context.Context, client *netbird.Client) error {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return startError(err)
+			return startError(err, refusal)
 		}
 		return nil
 	case <-ctx.Done():
@@ -432,9 +459,10 @@ func startBounded(ctx context.Context, client *netbird.Client) error {
 
 	select {
 	case err := <-errCh:
-		if err == nil {
-			stopClient(client)
+		if err != nil {
+			return startError(err, refusal)
 		}
+		stopClient(client)
 	case <-time.After(startGrace):
 		go func() {
 			if err := <-errCh; err == nil {
@@ -445,12 +473,12 @@ func startBounded(ctx context.Context, client *netbird.Client) error {
 	return fmt.Errorf("start embedded netbird client: %w", ctx.Err())
 }
 
-// startError turns a management refusal of the persisted key into the
-// actionable ErrIdentityRejected, keeping the raw error attached.
-func startError(err error) error {
+// startError turns a management refusal into the actionable refusal error for
+// the credential in use, keeping the raw error attached.
+func startError(err, refusal error) error {
 	switch grpcCode(err) {
 	case codes.PermissionDenied, codes.Unauthenticated, codes.InvalidArgument, codes.NotFound:
-		return fmt.Errorf("%w: %v", ErrIdentityRejected, err)
+		return fmt.Errorf("%w: %v", refusal, err)
 	default:
 		return fmt.Errorf("start embedded netbird client: %w", err)
 	}

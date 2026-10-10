@@ -2,6 +2,8 @@ package shell
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,8 +17,11 @@ func TestNetbirdSSHOptions(t *testing.T) {
 		"-o", "ProxyCommand='/opt/brev bin/brev' nb-proxy 100.73.1.2 2222",
 		"-o", "ProxyJump=none",
 		"-o", "ConnectTimeout=90",
-		"-o", "ControlMaster=no",
-		"-o", "ControlPath=none",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=~/.brev/nb-control-%C",
+		"-o", "ControlPersist=30s",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("options = %q, want %q", got, want)
@@ -25,6 +30,52 @@ func TestNetbirdSSHOptions(t *testing.T) {
 		if strings.HasPrefix(o, "HostName=") || strings.HasPrefix(o, "Port=") {
 			t.Errorf("HostName and Port must not be overridden, they break 'Match host <alias>': %q", o)
 		}
+	}
+}
+
+func TestNetbirdSSHOptionsEscapesPercentInPath(t *testing.T) {
+	target := meshTarget{addr: netip.MustParseAddr("100.73.1.2"), port: 22}
+	got := netbirdSSHOptions("/home/me/100% done/brev", target)
+	if !strings.Contains(got[1], "'/home/me/100%% done/brev' nb-proxy") {
+		t.Errorf("a %% in the binary path must be doubled for OpenSSH's percent expansion, got %q", got[1])
+	}
+}
+
+func TestAliasConfigured(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "ssh_config")
+	cfg := `# included in /home/me/.ssh/config
+Match host my-ws exec "brev mint-cert --env env_1"
+  IdentityFile "/home/me/.brev/ssh-certs/env_1"
+Host my-ws
+  HostName 1.2.3.4
+  User ubuntu
+Host my-ws-host
+  HostName 1.2.3.4
+`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	tests := []struct {
+		alias string
+		want  bool
+	}{
+		{alias: "my-ws", want: true},
+		{alias: "my-ws-host", want: true},
+		{alias: "my-w", want: false},
+		{alias: "other", want: false},
+	}
+	for _, tt := range tests {
+		got, err := aliasConfigured(cfgPath, tt.alias)
+		if err != nil {
+			t.Fatalf("aliasConfigured(%q): %v", tt.alias, err)
+		}
+		if got != tt.want {
+			t.Errorf("aliasConfigured(%q) = %v, want %v", tt.alias, got, tt.want)
+		}
+	}
+	if _, err := aliasConfigured(filepath.Join(dir, "missing"), "my-ws"); err == nil {
+		t.Error("a missing config file should be reported, so the caller refreshes")
 	}
 }
 

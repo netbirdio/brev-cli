@@ -14,12 +14,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/netbirdio/netbird/util/netrelay"
 	"github.com/spf13/cobra"
 
+	breverrors "github.com/brevdev/brev-cli/pkg/errors"
 	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 )
 
@@ -41,16 +44,28 @@ func NewCmdNBProxy() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port, err := strconv.ParseUint(args[1], 10, 16)
 			if err != nil {
-				return fmt.Errorf("invalid port %q: %w", args[1], err)
+				return breverrors.NewValidationError(fmt.Sprintf("invalid port %q", args[1]))
 			}
-			return run(cmd.Context(), args[0], uint16(port))
+			// Every failure here is a tunnel condition the user can act on, not
+			// a crash: report it plainly and keep it out of error telemetry.
+			if err := run(cmd.Context(), args[0], uint16(port)); err != nil {
+				return breverrors.NewValidationError("Brev tunnel: " + err.Error())
+			}
+			return nil
 		},
 	}
 }
 
 func run(ctx context.Context, host string, port uint16) error {
+	// ssh ends the session by closing our pipes and sending SIGHUP; turn that
+	// into a context cancel so the relay returns and the engine is stopped.
+	// A write to a pipe ssh already closed must surface as EPIPE, not kill us.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	signal.Ignore(syscall.SIGPIPE)
+
 	// The tunnel redirects os.Stderr into its log while the engine runs; keep
-	// the real one so progress and errors still reach the user through ssh.
+	// the real one so progress still reaches the user through ssh.
 	stderr := os.Stderr
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -99,9 +114,9 @@ func progressf(w io.Writer, format string, args ...any) {
 
 // stdioConn presents the process stdio as one closable stream for the relay.
 // Read and Write are promoted from the embedded fields so io.EOF reaches the
-// relay unwrapped. Close really closes both ends: when the overlay side goes
-// away first, closing stdout hands ssh its EOF and closing stdin unblocks the
-// pending read, so the ProxyCommand exits instead of hanging.
+// relay unwrapped. Close closes stdout so ssh sees EOF when the overlay side
+// goes away first; the stdin read ends when ssh closes its end of the pipe or
+// signals us, which the context above turns into a relay cancel.
 type stdioConn struct {
 	io.Reader
 	io.Writer

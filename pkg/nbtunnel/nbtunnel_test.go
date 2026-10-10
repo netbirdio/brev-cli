@@ -232,6 +232,19 @@ func TestDiscardForeignIdentity(t *testing.T) {
 			t.Fatalf("discardForeignIdentity: %v", err)
 		}
 	})
+
+	t.Run("unreadable config starts fresh", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, configFile), []byte("{truncated"), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		if err := discardForeignIdentity(dir, "https://m.example.com"); err != nil {
+			t.Fatalf("discardForeignIdentity: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, configFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Error("a config that cannot be parsed should be discarded so the retry can enroll")
+		}
+	})
 }
 
 func TestSameManagementURL(t *testing.T) {
@@ -252,18 +265,37 @@ func TestSameManagementURL(t *testing.T) {
 }
 
 func TestStartErrorMapsManagementRefusals(t *testing.T) {
-	refusal := fmt.Errorf("login: %w", status.Error(codes.PermissionDenied, "peer not registered"))
-	err := startError(refusal)
+	denied := fmt.Errorf("login: %w", status.Error(codes.PermissionDenied, "peer not registered"))
+	err := startError(denied, ErrIdentityRejected)
 	if !errors.Is(err, ErrIdentityRejected) {
 		t.Errorf("a PermissionDenied login should map to ErrIdentityRejected, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "peer not registered") {
 		t.Errorf("the raw cause should stay attached, got %v", err)
 	}
+	// During enrollment the same refusal means the setup key, not the identity.
+	if err := startError(denied, ErrSetupKeyRejected); !errors.Is(err, ErrSetupKeyRejected) || errors.Is(err, ErrIdentityRejected) {
+		t.Errorf("during enrollment a refusal should map to ErrSetupKeyRejected, got %v", err)
+	}
 
-	other := startError(errors.New("dial tcp: connection refused"))
+	other := startError(errors.New("dial tcp: connection refused"), ErrIdentityRejected)
 	if errors.Is(other, ErrIdentityRejected) {
 		t.Errorf("a transport failure must not be reported as a rejected identity: %v", other)
+	}
+}
+
+func TestCheckAvailable(t *testing.T) {
+	dir := t.TempDir()
+	if err := CheckAvailable(dir); err != nil {
+		t.Fatalf("CheckAvailable on an idle dir: %v", err)
+	}
+	unlock, err := lock(dir)
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	defer unlock()
+	if err := CheckAvailable(dir); !errors.Is(err, ErrLocked) {
+		t.Fatalf("CheckAvailable while locked: got %v, want ErrLocked", err)
 	}
 }
 

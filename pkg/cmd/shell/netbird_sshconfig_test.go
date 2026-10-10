@@ -65,8 +65,14 @@ func TestNetbirdOptionsKeepGeneratedConfig(t *testing.T) {
 	if got["hostname"] != "myws" {
 		t.Errorf("hostname = %q, want the alias left untouched", got["hostname"])
 	}
-	if got["controlmaster"] != "false" {
-		t.Errorf("controlmaster = %q, want false", got["controlmaster"])
+	if got["controlmaster"] != "auto" {
+		t.Errorf("controlmaster = %q, want auto so a second session multiplexes over the tunnel", got["controlmaster"])
+	}
+	if !strings.Contains(got["controlpath"], "nb-control-") {
+		t.Errorf("controlpath = %q, want the brev-owned --netbird socket, not the gateway one", got["controlpath"])
+	}
+	if got["stricthostkeychecking"] != "false" || got["userknownhostsfile"] != "/dev/null" {
+		t.Errorf("host key options = %q / %q, want the posture of brev's generated entries", got["stricthostkeychecking"], got["userknownhostsfile"])
 	}
 	if got["connecttimeout"] != "90" {
 		t.Errorf("connecttimeout = %q, want 90 (first -o wins)", got["connecttimeout"])

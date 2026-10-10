@@ -1,12 +1,17 @@
 package shell
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
 	"connectrpc.com/connect"
@@ -18,11 +23,20 @@ import (
 	"github.com/brevdev/brev-cli/pkg/config"
 	"github.com/brevdev/brev-cli/pkg/entity"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/files"
 	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 	"github.com/brevdev/brev-cli/pkg/ssh"
 )
 
-const defaultSSHPort = 22
+const (
+	defaultSSHPort = 22
+	// sshFailureExit is the status OpenSSH itself exits with; anything else is
+	// the remote command's status and not a connection problem.
+	sshFailureExit = 255
+	// netbirdControlPath keeps --netbird sessions on their own control socket so
+	// they never attach to a gateway-path master for the same alias.
+	netbirdControlPath = "~/.brev/nb-control-%C"
+)
 
 // meshTarget is where a Brev machine's sshd listens inside the NetBird overlay,
 // plus the ssh_config alias whose user and certificate hook still apply.
@@ -45,7 +59,9 @@ func (m meshTarget) hostPort() string {
 // system ssh against the usual alias with the overlay hop supplied as a
 // ProxyCommand (brev nb-proxy), which starts the embedded tunnel for the
 // session. The alias entry is left untouched, so the Match host block that
-// mints the certificate, the user and agent forwarding keep working.
+// mints the certificate, the user and agent forwarding keep working. Tunnel
+// preconditions are checked here first, because once ssh is running every
+// failure inside the ProxyCommand looks the same from the outside.
 func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 	if host {
 		return breverrors.NewValidationError("--host cannot be combined with --netbird yet")
@@ -57,7 +73,8 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 	if err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
-	if !nbtunnel.IsRegistered(nbtunnel.Dir(home)) {
+	dir := nbtunnel.Dir(home)
+	if !nbtunnel.IsRegistered(dir) {
 		return breverrors.NewValidationError(nbtunnel.ErrNotRegistered.Error())
 	}
 
@@ -65,30 +82,81 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 	if err != nil {
 		return err
 	}
+	// A live control master for this alias means ssh will multiplex over the
+	// running tunnel and spawn no second proxy, so the identity lock is fine.
+	if !controlMasterAlive(target.alias) {
+		if err := nbtunnel.CheckAvailable(dir); err != nil {
+			return breverrors.NewValidationError(err.Error())
+		}
+	}
+	if err := ensureAliasConfigured(sstore, files.GetBrevSSHConfigPath(home), target.alias); err != nil {
+		return err
+	}
+
 	opts := netbirdSSHOptions(brevExecutable(), target)
 	_, _ = fmt.Fprintf(os.Stderr, "Resolved SSH target: %s via NetBird %s\n", target.alias, target.hostPort())
-
-	if err := runSSHWithOptions(target.alias, target.host, false, opts...); err == nil {
-		trackNetbirdShell(sstore, target)
-		return nil
+	if err := runSSHWithOptions(target.alias, target.host, false, opts...); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() != sshFailureExit {
+			// The session ran; the remote shell's own exit status is not ours.
+			return nil
+		}
+		return breverrors.NewValidationError(fmt.Sprintf(
+			"connection to %s over NetBird failed; the messages above say why (tunnel log: %s)",
+			target.name, filepath.Join(dir, "tunnel.log")))
 	}
-	// The alias may be missing from ~/.brev/ssh_config on a fresh install.
-	// brev shell handles that the same way: refresh the config and retry once.
-	_, _ = fmt.Fprintln(os.Stderr, "\nConnection failed, refreshing SSH config and retrying...")
-	if err := refresh.RunRefreshAsync(sstore).Await(); err != nil {
-		return breverrors.WrapAndTrace(err)
-	}
-	if err := runSSHWithOptions(target.alias, target.host, true, opts...); err != nil {
-		return breverrors.WrapAndTrace(err)
-	}
-	trackNetbirdShell(sstore, target)
-	return nil
-}
-
-func trackNetbirdShell(sstore ShellStore, target meshTarget) {
 	if target.workspace != nil {
 		trackShellAnalytics(sstore, target.workspace)
 	}
+	return nil
+}
+
+// ensureAliasConfigured regenerates ~/.brev/ssh_config when the alias is not
+// in it yet, so the first ssh attempt already carries the user and the
+// certificate hook instead of failing into an interactive prompt.
+func ensureAliasConfigured(sstore ShellStore, configPath, alias string) error {
+	configured, err := aliasConfigured(configPath, alias)
+	if err == nil && configured {
+		return nil
+	}
+	_, _ = fmt.Fprintln(os.Stderr, "Refreshing SSH config...")
+	if err := refresh.RunRefreshAsync(sstore).Await(); err != nil {
+		return breverrors.WrapAndTrace(err)
+	}
+	return nil
+}
+
+// aliasConfigured reports whether configPath has a Host or Match host block
+// for alias.
+func aliasConfigured(configPath, alias string) (bool, error) {
+	f, err := os.Open(configPath)
+	if err != nil {
+		return false, fmt.Errorf("open ssh config: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read only
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		switch {
+		case len(fields) >= 2 && strings.EqualFold(fields[0], "Host") && fields[1] == alias:
+			return true, nil
+		case len(fields) >= 3 && strings.EqualFold(fields[0], "Match") && strings.EqualFold(fields[1], "host") && fields[2] == alias:
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read ssh config: %w", err)
+	}
+	return false, nil
+}
+
+// controlMasterAlive asks OpenSSH whether a --netbird control master for alias
+// is still running.
+func controlMasterAlive(alias string) bool {
+	cmd := exec.Command("ssh", "-o", "ControlPath="+netbirdControlPath, "-O", "check", alias) //nolint:gosec // alias is the resolved brev ssh alias
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Run() == nil
 }
 
 // brevExecutable returns the running binary for the ProxyCommand, matching
@@ -223,15 +291,25 @@ func sshServerPort(ports []*nodev1.Port, portID string) uint16 {
 // anything in the alias entry that would route around it. HostName is left
 // alone on purpose: OpenSSH evaluates `Match host` against the substituted
 // hostname, so overriding it would skip the block that mints the certificate.
-// ControlMaster is off because the proxy lives only as long as this session,
-// and ConnectTimeout covers the tunnel start and peer wait inside it.
+// Sessions multiplex over a brev-owned control socket, so a second
+// `brev ssh --netbird` to the same machine reuses the running tunnel instead
+// of starting a second peer; the master lingers briefly after the last
+// session so the tunnel and its lock go away soon afterwards. ConnectTimeout
+// covers the tunnel start and peer wait inside the proxy. Host keys follow
+// the posture of every brev-generated entry.
 func netbirdSSHOptions(brevBin string, target meshTarget) []string {
-	proxy := shellescape.QuoteCommand([]string{brevBin, "nb-proxy", target.addr.String(), strconv.Itoa(int(target.port))})
+	// OpenSSH percent-expands ProxyCommand, so a literal % in the path must
+	// be doubled.
+	bin := strings.ReplaceAll(brevBin, "%", "%%")
+	proxy := shellescape.QuoteCommand([]string{bin, "nb-proxy", target.addr.String(), strconv.Itoa(int(target.port))})
 	return []string{
 		"-o", "ProxyCommand=" + proxy,
 		"-o", "ProxyJump=none",
 		"-o", "ConnectTimeout=90",
-		"-o", "ControlMaster=no",
-		"-o", "ControlPath=none",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + netbirdControlPath,
+		"-o", "ControlPersist=30s",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
 	}
 }
