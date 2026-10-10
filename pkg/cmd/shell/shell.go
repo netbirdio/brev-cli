@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
+	"github.com/alessio/shellescape"
 
 	"github.com/brevdev/brev-cli/pkg/analytics"
 	"github.com/brevdev/brev-cli/pkg/cmd/completions"
@@ -38,6 +39,9 @@ var (
   # SSH into the host machine instead of the container
   brev shell my-instance --host
 
+  # Connect over the Brev tunnel (NetBird) after 'brev register --embedded'
+  brev ssh --netbird my-instance
+
   # For non-interactive command execution, use 'brev exec':
   brev exec my-instance "nvidia-smi"`
 )
@@ -52,6 +56,7 @@ type ShellStore interface {
 
 func NewCmdShell(t *terminal.Terminal, store ShellStore, noLoginStartStore ShellStore) *cobra.Command {
 	var host bool
+	var viaNetbird bool
 	cmd := &cobra.Command{
 		Annotations:           map[string]string{"access": ""},
 		Use:                   "shell <instance>",
@@ -64,7 +69,7 @@ func NewCmdShell(t *terminal.Terminal, store ShellStore, noLoginStartStore Shell
 		ValidArgsFunction:     completions.GetAllWorkspaceNameCompletionHandler(noLoginStartStore, t),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			instanceName := args[0]
-			err := runShellCommand(t, store, instanceName, host)
+			err := runShellCommand(t, store, instanceName, host, viaNetbird)
 			if err != nil {
 				return breverrors.WrapAndTrace(err)
 			}
@@ -72,11 +77,15 @@ func NewCmdShell(t *terminal.Terminal, store ShellStore, noLoginStartStore Shell
 		},
 	}
 	cmd.Flags().BoolVarP(&host, "host", "", false, "ssh into the host machine instead of the container")
+	cmd.Flags().BoolVar(&viaNetbird, "netbird", false, "connect over the embedded Brev tunnel (NetBird) instead of the public SSH endpoint; requires 'brev register --embedded'")
 
 	return cmd
 }
 
-func runShellCommand(t *terminal.Terminal, sstore ShellStore, workspaceNameOrID string, host bool) error {
+func runShellCommand(t *terminal.Terminal, sstore ShellStore, workspaceNameOrID string, host, viaNetbird bool) error {
+	if viaNetbird {
+		return runShellViaNetbird(t, sstore, workspaceNameOrID, host)
+	}
 	if _, err := sstore.GetAccessToken(); err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
@@ -180,14 +189,20 @@ func runSSH(sshAlias string, host bool) error {
 	return runSSHWithOptions(sshAlias, host, true)
 }
 
-func runSSHWithOptions(sshAlias string, host bool, printFailureAdvice bool) error {
+// runSSHWithOptions execs the system ssh against sshAlias. extraOpts are placed
+// before brev's own -o flags because OpenSSH keeps the first value it sees.
+func runSSHWithOptions(sshAlias string, host bool, printFailureAdvice bool, extraOpts ...string) error {
 	sshAgentEval := `if [ -z "$SSH_AUTH_SOCK" ]; then eval $(ssh-agent -s) > /dev/null; fi`
+	sshOpts := ""
+	if len(extraOpts) > 0 {
+		sshOpts = shellescape.QuoteCommand(extraOpts) + " "
+	}
 	var cmd string
 	if host {
-		cmd = fmt.Sprintf("%s && ssh -o ConnectTimeout=5 %s", sshAgentEval, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh %s-o ConnectTimeout=5 %s", sshAgentEval, sshOpts, sshAlias)
 	} else {
 		// SSH into VM and respect container WORKDIR if containerized, otherwise use default directory
-		cmd = fmt.Sprintf("%s && ssh -t -o ConnectTimeout=5 %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh -t %s-o ConnectTimeout=5 %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, sshOpts, sshAlias)
 	}
 
 	var stderrBuf bytes.Buffer

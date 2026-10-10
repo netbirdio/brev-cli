@@ -12,6 +12,7 @@ import (
 
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
 	"github.com/brevdev/brev-cli/pkg/files"
+	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 	"github.com/spf13/afero"
 )
 
@@ -39,6 +40,9 @@ type DeviceRegistration struct {
 	HardwareProfile      HardwareProfile `json:"hardware_profile"`
 	Status               string          `json:"status,omitempty"`
 	CertificateAuthority string          `json:"certificate_authority,omitempty"`
+	// Embedded marks a registration made with the embedded NetBird client,
+	// which keeps its state in the user's home and can only be an SSH client.
+	Embedded bool `json:"embedded,omitempty"`
 }
 
 // RegistrationStore defines the contract for persisting device registration data.
@@ -50,31 +54,67 @@ type RegistrationStore interface {
 	Exists() (bool, error)
 }
 
-type FileRegistrationStore struct{}
+type FileRegistrationStore struct {
+	dir func() (string, error)
+	// sudoFallback retries a failed write through sudo, which only the
+	// system-wide /etc/brev location needs.
+	sudoFallback bool
+}
 
 // NewFileRegistrationStore returns a FileRegistrationStore that reads/writes
 // from /etc/brev/device_registration.json.
 func NewFileRegistrationStore() *FileRegistrationStore {
-	return &FileRegistrationStore{}
+	return &FileRegistrationStore{
+		dir:          func() (string, error) { return globalRegistrationDir, nil },
+		sudoFallback: true,
+	}
 }
 
-func (s *FileRegistrationStore) path() string {
-	return filepath.Join(globalRegistrationDir, registrationFileName)
+// NewUserRegistrationStore returns a FileRegistrationStore under the embedded
+// tunnel directory in the user's home, where --embedded registrations live
+// without needing sudo.
+func NewUserRegistrationStore() *FileRegistrationStore {
+	return &FileRegistrationStore{dir: func() (string, error) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("user home dir: %w", err)
+		}
+		return nbtunnel.Dir(home), nil
+	}}
+}
+
+func (s *FileRegistrationStore) path() (string, error) {
+	dir, err := s.dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, registrationFileName), nil
 }
 
 func (s *FileRegistrationStore) Save(reg *DeviceRegistration) error {
-	path := s.path()
+	path, err := s.path()
+	if err != nil {
+		return breverrors.WrapAndTrace(err)
+	}
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
 
+	dirMode, fileMode := os.FileMode(0o755), os.FileMode(0o644)
+	if !s.sudoFallback {
+		dirMode, fileMode = 0o700, 0o600
+	}
 	// Try direct write first (works in tests with in-memory FS and when running as root).
-	mkdirErr := files.AppFs.MkdirAll(filepath.Dir(path), 0o755)
-	if mkdirErr == nil {
-		if writeErr := afero.WriteFile(files.AppFs, path, data, 0o644); writeErr == nil {
-			return nil
-		}
+	writeErr := files.AppFs.MkdirAll(filepath.Dir(path), dirMode)
+	if writeErr == nil {
+		writeErr = afero.WriteFile(files.AppFs, path, data, fileMode)
+	}
+	if writeErr == nil {
+		return nil
+	}
+	if !s.sudoFallback {
+		return breverrors.WrapAndTrace(writeErr)
 	}
 
 	// Fall back to sudo for non-root users writing to /etc/brev/.
@@ -125,7 +165,10 @@ func validateRegistration(reg *DeviceRegistration) error {
 }
 
 func read(s *FileRegistrationStore) (*DeviceRegistration, error) {
-	path := s.path()
+	path, err := s.path()
+	if err != nil {
+		return nil, err
+	}
 	exists, err := s.Exists()
 	if !exists {
 		if err != nil {
@@ -141,12 +184,15 @@ func read(s *FileRegistrationStore) (*DeviceRegistration, error) {
 }
 
 func (s *FileRegistrationStore) Delete() error {
-	path := s.path()
-	err := files.DeleteFile(files.AppFs, path)
+	path, err := s.path()
+	if err != nil {
+		return breverrors.WrapAndTrace(err)
+	}
+	err = files.DeleteFile(files.AppFs, path)
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, fs.ErrPermission) {
+	if !errors.Is(err, fs.ErrPermission) || !s.sudoFallback {
 		return breverrors.WrapAndTrace(err)
 	}
 	// Fall back to sudo for non-root users.
@@ -154,8 +200,11 @@ func (s *FileRegistrationStore) Delete() error {
 }
 
 func (s *FileRegistrationStore) Exists() (bool, error) {
-	path := s.path()
-	_, err := files.AppFs.Stat(path)
+	path, err := s.path()
+	if err != nil {
+		return false, breverrors.WrapAndTrace(err)
+	}
+	_, err = files.AppFs.Stat(path)
 	if err == nil {
 		return true, nil
 	}

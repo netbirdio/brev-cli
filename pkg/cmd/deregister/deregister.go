@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/user"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
@@ -15,6 +16,7 @@ import (
 	"github.com/brevdev/brev-cli/pkg/config"
 	"github.com/brevdev/brev-cli/pkg/entity"
 	"github.com/brevdev/brev-cli/pkg/externalnode"
+	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 	"github.com/brevdev/brev-cli/pkg/sshcert"
 	"github.com/brevdev/brev-cli/pkg/sudo"
 	"github.com/brevdev/brev-cli/pkg/terminal"
@@ -64,6 +66,21 @@ type deregisterDeps struct {
 	legacyKeys        LegacySSHKeyRemover
 	// currentUser resolves the OS user for authorized_keys operations.
 	currentUser func() (*user.User, error)
+	// userRegistrationStore and tunnelRemover serve registrations made with
+	// --embedded, which live in the user's home and installed nothing.
+	userRegistrationStore register.RegistrationStore
+	tunnelRemover         func() error
+}
+
+func removeEmbeddedTunnel() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("user home dir: %w", err)
+	}
+	if err := nbtunnel.Remove(nbtunnel.Dir(home)); err != nil {
+		return fmt.Errorf("remove embedded tunnel: %w", err)
+	}
+	return nil
 }
 
 func defaultDeregisterDeps() deregisterDeps {
@@ -78,6 +95,9 @@ func defaultDeregisterDeps() deregisterDeps {
 		legacyKeys:        legacyKeyRemover{},
 		registrationStore: register.NewFileRegistrationStore(),
 		currentUser:       user.Current,
+
+		userRegistrationStore: register.NewUserRegistrationStore(),
+		tunnelRemover:         removeEmbeddedTunnel,
 	}
 }
 
@@ -85,7 +105,9 @@ var (
 	deregisterLong = `Deregister your device from NVIDIA Brev
 
 This command removes the local registration data and uninstalls
-the Brev tunnel (network agent).`
+the Brev tunnel (network agent). A device registered with
+'brev register --embedded' only has its tunnel identity deleted,
+since nothing was installed.`
 
 	deregisterExample = `  brev deregister`
 )
@@ -171,18 +193,40 @@ func findNodeByDeviceID(ctx context.Context, s externalnode.TokenProvider, deps 
 	}
 }
 
+// loadRegistration prefers an embedded registration in the user's home over
+// the native one under /etc/brev, and reports which kind it found.
+func loadRegistration(deps deregisterDeps) (*register.DeviceRegistration, bool, error) {
+	if deps.userRegistrationStore != nil {
+		if exists, err := deps.userRegistrationStore.Exists(); err == nil && exists {
+			reg, err := deps.userRegistrationStore.LoadAll()
+			if err != nil {
+				return nil, false, err //nolint:wrapcheck // do not present stack trace for this error
+			}
+			return reg, true, nil
+		}
+	}
+	reg, err := deps.registrationStore.LoadAll() // deregister should still work for pending registrations
+	if err != nil {
+		return nil, false, err //nolint:wrapcheck // do not present stack trace for this error
+	}
+	return reg, false, nil
+}
+
 func runDeregister(ctx context.Context, t *terminal.Terminal, s DeregisterStore, deps deregisterDeps, skipConfirm bool) error { //nolint:funlen,gocyclo // deregistration flow
+	reg, embedded, err := loadRegistration(deps)
+	if err != nil {
+		return err
+	}
+	if embedded {
+		return runDeregisterEmbedded(ctx, t, s, deps, reg, skipConfirm)
+	}
+
 	if !deps.platform.IsCompatible() {
 		return fmt.Errorf("brev deregister is only supported on Linux")
 	}
 
 	if err := deps.gater.Gate(t, deps.confirmer, "Device deregistration", skipConfirm); err != nil {
 		return fmt.Errorf("sudo issue: %w", err)
-	}
-
-	reg, err := deps.registrationStore.LoadAll() // deregister should still work for pending registrations
-	if err != nil {
-		return err //nolint:wrapcheck // do not present stack trace for this error
 	}
 
 	// Only prompt for login when there is a device to deregister.
@@ -276,6 +320,69 @@ func runDeregister(ctx context.Context, t *terminal.Terminal, s DeregisterStore,
 	t.Vprintf("%s  Deregistration complete.\n", t.Green("  ✓"))
 	t.Vprint("")
 
+	return nil
+}
+
+// runDeregisterEmbedded removes the node from Brev and deletes the embedded
+// tunnel identity; there is no service to uninstall and no authorized_keys to
+// clean, because an embedded device was never an SSH target.
+func runDeregisterEmbedded(ctx context.Context, t *terminal.Terminal, s DeregisterStore, deps deregisterDeps, reg *register.DeviceRegistration, skipConfirm bool) error {
+	if _, err := s.GetCurrentUser(); err != nil {
+		return breverrors.WrapAndTrace(err)
+	}
+	orgName := reg.OrgName
+	if orgName == "" {
+		orgName = "(unknown)"
+	}
+
+	t.Vprint("")
+	t.Vprint(t.White("══════════════════════════════════════════════════"))
+	t.Vprint(t.White("  Deregistering your device from Brev"))
+	t.Vprint(t.White("══════════════════════════════════════════════════"))
+	t.Vprint("")
+	if !skipConfirm {
+		t.Vprint(t.Green("  Please confirm before continuing:"))
+		t.Vprint("")
+	}
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Device:")), t.BoldBlue(reg.DisplayName+" ("+reg.ExternalNodeID+")"))
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Organization:")), t.BoldBlue(orgName+" ("+reg.OrgID+")"))
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Tunnel:")), t.BoldBlue("embedded"))
+	t.Vprint("")
+	t.Vprint(t.Yellow("  This will:"))
+	t.Vprint("    1. Remove this device from Brev")
+	t.Vprint("    2. Delete the embedded Brev tunnel identity and local registration data")
+	t.Vprint("")
+
+	if !skipConfirm {
+		confirm := deps.prompter.Select(
+			"Proceed with deregistration?",
+			[]string{"Yes, proceed", "No, cancel"},
+		)
+		if confirm != "Yes, proceed" {
+			t.Vprint("Deregistration canceled.")
+			return nil
+		}
+	}
+
+	t.Vprint(t.Yellow("[Step 1/2] Removing device from Brev..."))
+	if err := removeNodeFromBrev(ctx, t, s, deps, reg); err != nil {
+		return err
+	}
+	t.Vprint("")
+
+	t.Vprint(t.Yellow("[Step 2/2] Removing the embedded Brev tunnel..."))
+	if err := deps.userRegistrationStore.Delete(); err != nil {
+		t.Vprintf("  %s\n", t.Yellow(fmt.Sprintf("Warning: failed to remove local registration file: %v", err)))
+	}
+	if deps.tunnelRemover != nil {
+		if err := deps.tunnelRemover(); err != nil {
+			t.Vprintf("  %s\n", t.Yellow(fmt.Sprintf("Warning: failed to remove the tunnel identity: %v", err)))
+		} else {
+			t.Vprintf("%s  Embedded Brev tunnel removed.\n", t.Green("  ✓"))
+		}
+	}
+	t.Vprintf("%s  Deregistration complete.\n", t.Green("  ✓"))
+	t.Vprint("")
 	return nil
 }
 
