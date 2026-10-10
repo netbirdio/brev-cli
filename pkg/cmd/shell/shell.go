@@ -84,7 +84,7 @@ func NewCmdShell(t *terminal.Terminal, store ShellStore, noLoginStartStore Shell
 
 func runShellCommand(t *terminal.Terminal, sstore ShellStore, workspaceNameOrID string, host, viaNetbird bool) error {
 	if viaNetbird {
-		return runShellViaNetbird(t, sstore, workspaceNameOrID, host)
+		return runShellViaNetbird(sstore, workspaceNameOrID, host)
 	}
 	if _, err := sstore.GetAccessToken(); err != nil {
 		return breverrors.WrapAndTrace(err)
@@ -197,12 +197,13 @@ func runSSHWithOptions(sshAlias string, host bool, printFailureAdvice bool, extr
 	if len(extraOpts) > 0 {
 		sshOpts = shellescape.QuoteCommand(extraOpts) + " "
 	}
+	alias := shellescape.Quote(sshAlias)
 	var cmd string
 	if host {
-		cmd = fmt.Sprintf("%s && ssh %s-o ConnectTimeout=5 %s", sshAgentEval, sshOpts, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh %s-o ConnectTimeout=5 %s", sshAgentEval, sshOpts, alias)
 	} else {
 		// SSH into VM and respect container WORKDIR if containerized, otherwise use default directory
-		cmd = fmt.Sprintf("%s && ssh -t %s-o ConnectTimeout=5 %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, sshOpts, sshAlias)
+		cmd = fmt.Sprintf("%s && ssh -t %s-o ConnectTimeout=5 %s 'DIR=$(readlink -f /proc/1/cwd 2>/dev/null || pwd); cd \"$DIR\" || echo \"Warning: Could not access container directory\" >&2; exec -l ${SHELL:-/bin/sh}'", sshAgentEval, sshOpts, alias)
 	}
 
 	var stderrBuf bytes.Buffer

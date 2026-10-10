@@ -93,8 +93,8 @@ func (c Credentials) validate() error {
 		return errors.New("registration command carries no management URL")
 	}
 	u, err := url.Parse(c.ManagementURL)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return fmt.Errorf("registration command has an invalid management URL %q", c.ManagementURL)
+	if err != nil || u.Host == "" || u.Scheme != "https" {
+		return fmt.Errorf("registration command has an invalid management URL %q (https required)", c.ManagementURL)
 	}
 	return nil
 }

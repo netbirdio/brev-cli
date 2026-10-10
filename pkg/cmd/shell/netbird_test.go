@@ -9,16 +9,22 @@ import (
 )
 
 func TestNetbirdSSHOptions(t *testing.T) {
-	got := netbirdSSHOptions("127.0.0.1:43127")
+	target := meshTarget{addr: netip.MustParseAddr("100.73.1.2"), port: 2222}
+	got := netbirdSSHOptions("/opt/brev bin/brev", target)
 	want := []string{
-		"-o", "HostName=127.0.0.1",
-		"-o", "Port=43127",
-		"-o", "ConnectTimeout=15",
+		"-o", "ProxyCommand='/opt/brev bin/brev' nb-proxy 100.73.1.2 2222",
+		"-o", "ProxyJump=none",
+		"-o", "ConnectTimeout=90",
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=none",
 	}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Errorf("options = %v, want %v", got, want)
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("options = %q, want %q", got, want)
+	}
+	for _, o := range got {
+		if strings.HasPrefix(o, "HostName=") || strings.HasPrefix(o, "Port=") {
+			t.Errorf("HostName and Port must not be overridden, they break 'Match host <alias>': %q", o)
+		}
 	}
 }
 

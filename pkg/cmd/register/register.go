@@ -143,6 +143,7 @@ on this device, then 'brev grant-ssh' to grant users SSH access.
 
 Two modes are supported:
   • Interactive (default): run 'brev register' with no flags and follow prompts for device name and org.
+    A name given as the first argument ('brev register my-box') only skips the name prompt.
   • Non-interactive: use --name and --org. No prompts; --name is required, and
     --org is required unless API-key auth is active. Use for scripts/CI.
 
@@ -193,13 +194,14 @@ func NewCmdRegister(t *terminal.Terminal, store RegisterStore) *cobra.Command {
 			if err != nil {
 				return breverrors.WrapAndTrace(err)
 			}
-			if len(args) == 1 && nameFlag == "" {
-				nameFlag = args[0]
-			}
 			interactive := nameFlag == "" && orgFlag == "" && sshPort == 0
+			name := nameFlag
+			if name == "" && len(args) == 1 {
+				name = args[0]
+			}
 			opts := registerOpts{
 				interactive:       interactive,
-				name:              nameFlag,
+				name:              name,
 				orgName:           orgFlag,
 				skipConfirm:       approveFlag,
 				registrationToken: registrationTokenFlag,
@@ -235,13 +237,21 @@ type registerOpts struct {
 // one registration of either kind, never both.
 func prepareMode(t *terminal.Terminal, deps *registerDeps, opts registerOpts) error {
 	if opts.embedded {
-		if storeExists(deps.registrationStore) {
+		native, err := storeExists(deps.registrationStore)
+		if err != nil {
+			return err
+		}
+		if native {
 			return breverrors.NewValidationError("this device is already registered with the native Brev tunnel; run 'brev deregister' before registering with --embedded")
 		}
 		deps.registrationStore = deps.userRegistrationStore
 		return nil
 	}
-	if storeExists(deps.userRegistrationStore) {
+	embedded, err := storeExists(deps.userRegistrationStore)
+	if err != nil {
+		return err
+	}
+	if embedded {
 		return breverrors.NewValidationError("this device is registered with the embedded Brev tunnel; re-run with --embedded, or run 'brev deregister' first")
 	}
 	if !deps.platform.IsCompatible() {
@@ -254,12 +264,17 @@ func prepareMode(t *terminal.Terminal, deps *registerDeps, opts registerOpts) er
 	return nil
 }
 
-func storeExists(st RegistrationStore) bool {
+// storeExists fails closed: a registration file that cannot be inspected is
+// treated as a reason to stop rather than as absent.
+func storeExists(st RegistrationStore) (bool, error) {
 	if st == nil {
-		return false
+		return false, nil
 	}
 	exists, err := st.Exists()
-	return err == nil && exists
+	if err != nil {
+		return false, fmt.Errorf("check for an existing registration: %w", err)
+	}
+	return exists, nil
 }
 
 func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opts registerOpts, deps registerDeps) error { //nolint:gocognit,gocyclo,funlen // ok
@@ -322,8 +337,8 @@ func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opt
 		return checkExistingRegistration(ctx, t, s, deps, reg)
 	}
 
-	var name string
-	if opts.interactive {
+	name := opts.name
+	if opts.interactive && name == "" {
 		t.Vprint("")
 		name = terminal.PromptGetInput(terminal.PromptContent{
 			Label:      "Device name",
@@ -331,8 +346,6 @@ func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opt
 			AllowEmpty: false,
 		})
 		name = strings.TrimSpace(name)
-	} else {
-		name = opts.name
 	}
 	if err := names.ValidateNodeName(name); err != nil {
 		return err //nolint:wrapcheck // do not present stack trace for this error

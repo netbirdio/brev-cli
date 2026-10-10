@@ -1,5 +1,9 @@
 .DEFAULT_GOAL := fast-build
 VERSION := dev-$(shell git rev-parse HEAD | cut -c 1-8)
+# The embedded NetBird client reports this to Brev's management; without it
+# the module's version variable reads "development".
+NETBIRD_VERSION := $(shell go list -m -f '{{.Version}}' github.com/netbirdio/netbird 2>/dev/null | sed -E 's/^v//; s/-.*$$//')
+LDFLAGS := -X github.com/brevdev/brev-cli/pkg/cmd/version.Version=$(VERSION) -X github.com/netbirdio/netbird/version.version=$(NETBIRD_VERSION)
 
 # Cross-compilation via Docker (golang:1.25 native Linux container).
 # When arch=<GOOS>/<GOARCH> is provided, spin up a container that matches
@@ -25,7 +29,7 @@ endif
 fast-build: ## go build -o brev
 	$(call print-target)
 	echo ${VERSION}
-	$(_BUILD_PREFIX) go build -o brev -ldflags "-X github.com/brevdev/brev-cli/pkg/cmd/version.Version=${VERSION}"
+	$(_BUILD_PREFIX) go build -o brev -ldflags "$(LDFLAGS)"
 
 .PHONY: local
 local: ## build with env wrapper (use: make local env=dev0|dev1|dev2|stg arch=linux/amd64, or make local for defaults)
@@ -33,7 +37,7 @@ local: ## build with env wrapper (use: make local env=dev0|dev1|dev2|stg arch=li
 ifdef env
 	@echo "Building with env=$(env) wrapper..."
 	@echo ${VERSION}
-	$(_BUILD_PREFIX) go build -o brev-local -ldflags "-X github.com/brevdev/brev-cli/pkg/cmd/version.Version=${VERSION}"
+	$(_BUILD_PREFIX) go build -o brev-local -ldflags "$(LDFLAGS)"
 	@echo '#!/bin/sh' > brev
 	@echo '# Auto-generated wrapper with environment overrides' >> brev
 	@echo 'export BREV_CONSOLE_URL="https://dev.brev.nvidia.com"' >> brev
@@ -52,7 +56,7 @@ endif
 	@chmod +x brev
 else
 	@echo "Building without environment overrides (using config.go defaults)..."
-	$(_BUILD_PREFIX) go build -o brev -ldflags "-X github.com/brevdev/brev-cli/pkg/cmd/version.Version=${VERSION}"
+	$(_BUILD_PREFIX) go build -o brev -ldflags "$(LDFLAGS)"
 endif
 
 .PHONY: local-stack
@@ -223,13 +227,13 @@ full-smoke-test: ci fast-build
 build-linux-amd:
 	$(call print-target)
 	echo ${VERSION}
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o brev -ldflags "-X github.com/brevdev/brev-cli/pkg/cmd/version.Version=${VERSION}"
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o brev -ldflags "$(LDFLAGS)"
 
 .PHONY: build-darwin-amd
 build-darwin-amd:
 	$(call print-target)
 	echo ${VERSION}
-	GOOS=darwin GOARCH=amd64 go build -o brev -ldflags "-X github.com/brevdev/brev-cli/pkg/cmd/version.Version=${VERSION}"
+	GOOS=darwin GOARCH=amd64 go build -o brev -ldflags "$(LDFLAGS)"
 
 
 .PHONY: setup-workspace-repo

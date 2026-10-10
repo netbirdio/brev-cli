@@ -183,3 +183,19 @@ func Test_nodeLabels(t *testing.T) {
 		t.Errorf("embedded labels = %v", got)
 	}
 }
+
+type unreadableStore struct{ mockRegistrationStore }
+
+func (unreadableStore) Exists() (bool, error) { return false, errors.New("permission denied") }
+
+func Test_runRegister_Embedded_FailsClosedOnUnreadableNativeStore(t *testing.T) {
+	deps, server := testRegisterDeps(t, &fakeNodeService{}, &unreadableStore{})
+	defer server.Close()
+	deps.userRegistrationStore = &mockRegistrationStore{}
+	deps.tunnel = &mockEmbeddedTunnel{}
+
+	err := runRegister(context.Background(), terminal.New(), testRegisterStore(), embeddedOpts(), deps)
+	if err == nil || !strings.Contains(err.Error(), "existing registration") {
+		t.Fatalf("an unreadable native registration must stop the embedded registration, got %v", err)
+	}
+}

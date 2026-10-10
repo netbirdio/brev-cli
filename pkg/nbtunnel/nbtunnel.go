@@ -1,8 +1,8 @@
 // Package nbtunnel runs the NetBird client embedded in brev-cli so a device can
 // reach Brev machines over the NetBird overlay without installing the netbird
 // daemon. The peer identity lives under ~/.brev/netbird: brev register creates
-// it once from the setup key in Brev's registration command, and brev ssh
-// --netbird starts it for the length of one session.
+// it once from the setup key in Brev's registration command, and the nb-proxy
+// ProxyCommand behind brev ssh --netbird starts it for the length of a session.
 package nbtunnel
 
 import (
@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,9 @@ import (
 	"time"
 
 	netbird "github.com/netbirdio/netbird/client/embed"
-	"github.com/netbirdio/netbird/util/netrelay"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/brevdev/brev-cli/pkg/files"
 )
@@ -34,9 +37,9 @@ const (
 	lockFile     = "lock"
 
 	startTimeout = 45 * time.Second
+	startGrace   = 15 * time.Second
 	stopTimeout  = 5 * time.Second
-	dialTimeout  = 20 * time.Second
-	peerPoll     = 500 * time.Millisecond
+	peerPoll     = time.Second
 
 	envDisableNATMapper = "NB_DISABLE_NAT_MAPPER"
 )
@@ -46,6 +49,9 @@ var (
 	ErrNotRegistered = errors.New("the embedded Brev tunnel is not set up on this device; run 'brev register --embedded' first")
 	// ErrLocked means another brev process is already running the embedded peer.
 	ErrLocked = errors.New("another brev command is already using the embedded Brev tunnel; wait for it to finish")
+	// ErrIdentityRejected means management no longer accepts this device's key,
+	// usually because the device was removed from Brev.
+	ErrIdentityRejected = errors.New("this device's tunnel identity is no longer known to Brev; run 'brev deregister' and then 'brev register --embedded' again")
 )
 
 // Dir returns the directory holding the embedded tunnel identity for userHome.
@@ -53,8 +59,8 @@ func Dir(userHome string) string {
 	return filepath.Join(files.GetBrevHome(userHome), dirName)
 }
 
-// Identity is what brev register persists for later sessions. The WireGuard
-// private key stays in the netbird config file next to it.
+// Identity is what brev register persists once enrollment has succeeded. The
+// WireGuard private key stays in the netbird config file next to it.
 type Identity struct {
 	DeviceName    string `json:"device_name"`
 	ManagementURL string `json:"management_url"`
@@ -78,39 +84,38 @@ func Remove(dir string) error {
 	return nil
 }
 
-// Register creates a fresh peer identity under dir by logging in to management
-// once with the setup key, then stops the client. The setup key itself is never
-// written to disk; later sessions log in with the persisted private key.
+// Register enrolls the device by logging in to management once with the setup
+// key, then stops the client and persists the identity. The setup key itself is
+// never written to disk; later sessions log in with the persisted private key.
+//
+// A private key left behind by an earlier attempt is reused rather than
+// replaced: management logs a key it already knows straight in and only
+// registers it with the setup key when it does not, so a retry neither spends
+// the key twice nor leaks a peer. Only a different management URL, meaning a
+// different control plane, starts from a fresh key.
 func Register(ctx context.Context, dir, deviceName string, creds Credentials) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	unlock, err := lock(dir)
+	sess, err := openSession(dir)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer sess.close()
 
-	// A previous identity would be reused by the config loader and could
-	// collide with a peer management still knows; start from nothing.
-	for _, name := range []string{identityFile, configFile, stateFile} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale %s: %w", name, err)
-		}
-	}
-
-	logW, closeLog, err := openLog(dir)
-	if err != nil {
+	if err := discardForeignIdentity(dir, creds.ManagementURL); err != nil {
 		return err
 	}
-	defer closeLog()
 
 	client, err := newClient(dir, clientOptions{
 		deviceName:    deviceName,
 		managementURL: creds.ManagementURL,
 		setupKey:      creds.SetupKey,
-	}, logW)
+	}, sess.logFile)
 	if err != nil {
+		return err
+	}
+	if err := checkManagementURL(client, creds.ManagementURL); err != nil {
 		return err
 	}
 	if err := startBounded(ctx, client); err != nil {
@@ -118,12 +123,26 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 	}
 	stopClient(client)
 
-	id := Identity{
+	return writeJSON(filepath.Join(dir, identityFile), Identity{
 		DeviceName:    deviceName,
 		ManagementURL: creds.ManagementURL,
 		RegisteredAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// discardForeignIdentity removes a persisted key and state that belong to
+// another management server, so the setup key enrolls a fresh peer there.
+func discardForeignIdentity(dir, managementURL string) error {
+	existing, err := readConfigManagementURL(dir)
+	if err != nil || existing == "" || sameManagementURL(existing, managementURL) {
+		return nil
 	}
-	return writeJSON(filepath.Join(dir, identityFile), id)
+	for _, name := range []string{identityFile, configFile, stateFile} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // Tunnel is the embedded peer for one brev session.
@@ -132,19 +151,16 @@ type Tunnel struct {
 	client *netbird.Client
 	dial   func(ctx context.Context, addr string) (net.Conn, error)
 	peers  func() ([]peerInfo, error)
+	sess   *session
 
-	unlock   func()
-	closeLog func()
-
-	mu       sync.Mutex
-	started  bool
-	listener net.Listener
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	mu      sync.Mutex
+	started bool
+	closed  bool
 }
 
 // Open loads the identity under dir and prepares the client. It does not
-// connect; call Start.
+// connect; call Start. From Open until Close, os.Stderr and the global logrus
+// output point at the tunnel log, see session.
 func Open(dir string) (*Tunnel, error) {
 	id, err := readIdentity(dir)
 	if err != nil {
@@ -154,27 +170,25 @@ func Open(dir string) (*Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
-	unlock, err := lock(dir)
+	sess, err := openSession(dir)
 	if err != nil {
-		return nil, err
-	}
-	logW, closeLog, err := openLog(dir)
-	if err != nil {
-		unlock()
 		return nil, err
 	}
 	client, err := newClient(dir, clientOptions{
 		deviceName:    id.DeviceName,
 		managementURL: id.ManagementURL,
 		privateKey:    privateKey,
-	}, logW)
+	}, sess.logFile)
 	if err != nil {
-		closeLog()
-		unlock()
+		sess.close()
+		return nil, err
+	}
+	if err := checkManagementURL(client, id.ManagementURL); err != nil {
+		sess.close()
 		return nil, err
 	}
 
-	t := &Tunnel{id: id, client: client, unlock: unlock, closeLog: closeLog}
+	t := &Tunnel{id: id, client: client, sess: sess}
 	t.dial = func(ctx context.Context, addr string) (net.Conn, error) {
 		return client.Dial(ctx, "tcp", addr)
 	}
@@ -185,6 +199,11 @@ func Open(dir string) (*Tunnel, error) {
 // Identity returns the persisted identity this tunnel runs as.
 func (t *Tunnel) Identity() Identity {
 	return t.id
+}
+
+// LogPath returns the file the embedded client logs to.
+func (t *Tunnel) LogPath() string {
+	return t.sess.logFile.Name()
 }
 
 // Start logs in to management and brings the overlay up.
@@ -210,79 +229,22 @@ func (t *Tunnel) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	return t.dial(ctx, addr)
 }
 
-// ListenLoopback starts a listener on 127.0.0.1 that relays every accepted
-// connection to target over the overlay, and returns its address. OpenSSH is
-// pointed at it with HostName and Port overrides so the rest of the user's
-// ssh_config entry still applies.
-func (t *Tunnel) ListenLoopback(target string) (string, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", fmt.Errorf("listen on loopback: %w", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-
-	t.mu.Lock()
-	t.listener = ln
-	t.cancel = cancel
-	t.mu.Unlock()
-
-	t.wg.Add(1)
-	go t.serve(ctx, ln, target)
-	return ln.Addr().String(), nil
-}
-
-// Close stops the listener, the relays and the embedded client, and releases
+// Close stops the embedded client, restores stderr and logging, and releases
 // the identity lock. It is safe to call more than once.
 func (t *Tunnel) Close() {
 	t.mu.Lock()
-	cancel, ln, started := t.cancel, t.listener, t.started
-	t.cancel, t.listener, t.started = nil, nil, false
+	started, closed := t.started, t.closed
+	t.started, t.closed = false, true
 	t.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
+	if closed {
+		return
 	}
-	if ln != nil {
-		_ = ln.Close()
-	}
-	t.wg.Wait()
 	if started {
 		stopClient(t.client)
 	}
-	if t.closeLog != nil {
-		t.closeLog()
-		t.closeLog = nil
+	if t.sess != nil {
+		t.sess.close()
 	}
-	if t.unlock != nil {
-		t.unlock()
-		t.unlock = nil
-	}
-}
-
-func (t *Tunnel) serve(ctx context.Context, ln net.Listener, target string) {
-	defer t.wg.Done()
-	for {
-		local, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		t.wg.Add(1)
-		go func() {
-			defer t.wg.Done()
-			t.relay(ctx, local, target)
-		}()
-	}
-}
-
-func (t *Tunnel) relay(ctx context.Context, local net.Conn, target string) {
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	remote, err := t.dial(dialCtx, target)
-	cancel()
-	if err != nil {
-		_ = local.Close()
-		return
-	}
-	netrelay.Relay(ctx, local, remote, netrelay.Options{})
 }
 
 type peerInfo struct {
@@ -291,12 +253,12 @@ type peerInfo struct {
 }
 
 func (t *Tunnel) clientPeers() ([]peerInfo, error) {
-	status, err := t.client.Status()
+	st, err := t.client.Status()
 	if err != nil {
 		return nil, fmt.Errorf("embedded netbird status: %w", err)
 	}
-	out := make([]peerInfo, 0, len(status.Peers))
-	for _, p := range status.Peers {
+	out := make([]peerInfo, 0, len(st.Peers))
+	for _, p := range st.Peers {
 		out = append(out, peerInfo{ip: p.IP, connected: p.ConnStatus == netbird.PeerStatusConnected})
 	}
 	return out, nil
@@ -344,6 +306,41 @@ func sameAddr(entry string, ip netip.Addr) bool {
 	return addr.Unmap() == ip.Unmap()
 }
 
+// session owns the log file and the redirections that keep engine output off
+// the terminal for as long as an engine runs: embed.New points the global
+// logrus at its LogOutput, and pion writes ICE errors straight to os.Stderr,
+// which an ssh holding the terminal in raw mode would garble.
+type session struct {
+	unlock     func()
+	logFile    *os.File
+	prevStderr *os.File
+}
+
+func openSession(dir string) (*session, error) {
+	unlock, err := lock(dir)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, logFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		unlock()
+		return nil, fmt.Errorf("open tunnel log: %w", err)
+	}
+	s := &session{unlock: unlock, logFile: f, prevStderr: os.Stderr}
+	os.Stderr = f
+	return s, nil
+}
+
+// close restores stderr, then points logrus away from the file before closing
+// it, because engine goroutines can outlive Stop and would otherwise report a
+// closed log on the terminal.
+func (s *session) close() {
+	os.Stderr = s.prevStderr
+	logrus.SetOutput(io.Discard)
+	_ = s.logFile.Close()
+	s.unlock()
+}
+
 type clientOptions struct {
 	deviceName    string
 	managementURL string
@@ -381,8 +378,42 @@ func newClient(dir string, o clientOptions, logW io.Writer) (*netbird.Client, er
 	return client, nil
 }
 
+// checkManagementURL refuses to run when a NetBird MDM policy on this machine
+// has replaced the management URL Brev handed out, since the embedded peer
+// would then enroll with the wrong control plane.
+func checkManagementURL(client *netbird.Client, want string) error {
+	cfg, err := client.GetConfig()
+	if err != nil {
+		return fmt.Errorf("read embedded netbird config: %w", err)
+	}
+	if cfg.ManagementURL == nil || sameManagementURL(cfg.ManagementURL.String(), want) {
+		return nil
+	}
+	return fmt.Errorf("a NetBird policy on this machine forces the management URL %s, which is not Brev's %s; the embedded Brev tunnel cannot be used here", cfg.ManagementURL, want)
+}
+
+// sameManagementURL compares two management URLs by scheme and host, treating
+// an omitted :443 as present.
+func sameManagementURL(a, b string) bool {
+	return canonicalURL(a) == canonicalURL(b)
+}
+
+func canonicalURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	host := strings.ToLower(u.Host)
+	if u.Port() == "" && u.Scheme == "https" {
+		host += ":443"
+	}
+	return strings.ToLower(u.Scheme) + "://" + host
+}
+
 // startBounded wraps Start with a deadline of its own, because embed.Start
-// only honors ctx once the management login has completed.
+// only honors ctx once the management login has completed. On a timeout the
+// orphaned Start is given a short grace to return before the caller tears the
+// log and lock down underneath it.
 func startBounded(ctx context.Context, client *netbird.Client) error {
 	ctx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
@@ -393,31 +424,50 @@ func startBounded(ctx context.Context, client *netbird.Client) error {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return fmt.Errorf("start embedded netbird client: %w", err)
+			return startError(err)
 		}
 		return nil
 	case <-ctx.Done():
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			stopClient(client)
+		}
+	case <-time.After(startGrace):
 		go func() {
 			if err := <-errCh; err == nil {
 				stopClient(client)
 			}
 		}()
-		return fmt.Errorf("start embedded netbird client: %w", ctx.Err())
 	}
+	return fmt.Errorf("start embedded netbird client: %w", ctx.Err())
+}
+
+// startError turns a management refusal of the persisted key into the
+// actionable ErrIdentityRejected, keeping the raw error attached.
+func startError(err error) error {
+	switch grpcCode(err) {
+	case codes.PermissionDenied, codes.Unauthenticated, codes.InvalidArgument, codes.NotFound:
+		return fmt.Errorf("%w: %v", ErrIdentityRejected, err)
+	default:
+		return fmt.Errorf("start embedded netbird client: %w", err)
+	}
+}
+
+func grpcCode(err error) codes.Code {
+	var withStatus interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &withStatus) && withStatus.GRPCStatus() != nil {
+		return withStatus.GRPCStatus().Code()
+	}
+	return codes.Unknown
 }
 
 func stopClient(client *netbird.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()
 	_ = client.Stop(ctx)
-}
-
-func openLog(dir string) (io.Writer, func(), error) {
-	f, err := os.OpenFile(filepath.Join(dir, logFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open tunnel log: %w", err)
-	}
-	return f, func() { _ = f.Close() }, nil
 }
 
 func readIdentity(dir string) (Identity, error) {
@@ -438,26 +488,51 @@ func readIdentity(dir string) (Identity, error) {
 	return id, nil
 }
 
-// readPrivateKey pulls the WireGuard private key out of the netbird config
-// the embed package persisted, so later sessions can log in without a setup key.
-func readPrivateKey(dir string) (string, error) {
+// persistedConfig is the slice of netbird's profile config this package reads
+// back: the private key for later logins and the management URL to detect a
+// change of control plane. The key field has no json tag upstream.
+type persistedConfig struct {
+	PrivateKey    string
+	ManagementURL *url.URL
+}
+
+func readConfig(dir string) (persistedConfig, error) {
+	var cfg persistedConfig
 	data, err := os.ReadFile(filepath.Join(dir, configFile))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", ErrNotRegistered
+			return cfg, ErrNotRegistered
 		}
-		return "", fmt.Errorf("read netbird config: %w", err)
-	}
-	var cfg struct {
-		PrivateKey string
+		return cfg, fmt.Errorf("read netbird config: %w", err)
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "", fmt.Errorf("parse netbird config: %w", err)
+		return cfg, fmt.Errorf("parse netbird config: %w", err)
+	}
+	return cfg, nil
+}
+
+// readPrivateKey pulls the WireGuard private key out of the netbird config
+// the embed package persisted, so later sessions can log in without a setup key.
+func readPrivateKey(dir string) (string, error) {
+	cfg, err := readConfig(dir)
+	if err != nil {
+		return "", err
 	}
 	if cfg.PrivateKey == "" {
 		return "", ErrNotRegistered
 	}
 	return cfg.PrivateKey, nil
+}
+
+func readConfigManagementURL(dir string) (string, error) {
+	cfg, err := readConfig(dir)
+	if err != nil {
+		return "", err
+	}
+	if cfg.ManagementURL == nil {
+		return "", nil
+	}
+	return cfg.ManagementURL.String(), nil
 }
 
 func writeJSON(path string, v any) error {

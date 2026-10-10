@@ -1,8 +1,10 @@
-// Package nbproxy implements the hidden `brev nb-proxy <host> <port>` command
-// for use as an OpenSSH ProxyCommand: it starts the embedded Brev tunnel,
-// dials host:port over the NetBird overlay and relays stdin/stdout. It shares
-// the identity that `brev register --embedded` created, so an ssh_config entry
-// can reach the overlay without going through `brev ssh --netbird`.
+// Package nbproxy implements the hidden `brev nb-proxy <host> <port>` command,
+// the OpenSSH ProxyCommand behind `brev ssh --netbird`: it starts the embedded
+// Brev tunnel, waits for the target peer, dials host:port over the NetBird
+// overlay and relays stdin/stdout for the length of the session. Keeping the
+// overlay hop in a ProxyCommand leaves the ssh_config alias untouched, so the
+// `Match host <alias> exec "brev mint-cert ..."` block, the user and agent
+// forwarding keep applying.
 package nbproxy
 
 import (
@@ -47,6 +49,9 @@ func NewCmdNBProxy() *cobra.Command {
 }
 
 func run(ctx context.Context, host string, port uint16) error {
+	// The tunnel redirects os.Stderr into its log while the engine runs; keep
+	// the real one so progress and errors still reach the user through ssh.
+	stderr := os.Stderr
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("user home dir: %w", err)
@@ -57,19 +62,21 @@ func run(ctx context.Context, host string, port uint16) error {
 	}
 	defer tunnel.Close()
 
+	progressf(stderr, "starting the Brev tunnel")
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	err = tunnel.Start(startCtx)
 	cancel()
 	if err != nil {
-		return err //nolint:wrapcheck // already wrapped by the tunnel
+		return fmt.Errorf("%w (details in %s)", err, tunnel.LogPath())
 	}
 
 	if addr, perr := netip.ParseAddr(host); perr == nil {
+		progressf(stderr, "waiting for %s to connect over NetBird", host)
 		waitCtx, cancel := context.WithTimeout(ctx, peerTimeout)
 		err = tunnel.WaitForPeer(waitCtx, addr)
 		cancel()
 		if err != nil {
-			return err //nolint:wrapcheck // already wrapped by the tunnel
+			return err //nolint:wrapcheck // already names the cause
 		}
 	}
 
@@ -80,17 +87,34 @@ func run(ctx context.Context, host string, port uint16) error {
 	if err != nil {
 		return fmt.Errorf("dial %s over netbird: %w", target, err)
 	}
+	progressf(stderr, "connected to %s over NetBird", target)
 
-	netrelay.Relay(ctx, &stdioConn{Reader: os.Stdin, Writer: os.Stdout}, conn, netrelay.Options{})
+	netrelay.Relay(ctx, newStdioConn(), conn, netrelay.Options{})
 	return nil
+}
+
+func progressf(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, "brev: "+format+"\n", args...)
 }
 
 // stdioConn presents the process stdio as one closable stream for the relay.
 // Read and Write are promoted from the embedded fields so io.EOF reaches the
-// relay unwrapped.
+// relay unwrapped. Close really closes both ends: when the overlay side goes
+// away first, closing stdout hands ssh its EOF and closing stdin unblocks the
+// pending read, so the ProxyCommand exits instead of hanging.
 type stdioConn struct {
 	io.Reader
 	io.Writer
+	in  *os.File
+	out *os.File
 }
 
-func (*stdioConn) Close() error { return nil }
+func newStdioConn() *stdioConn {
+	return &stdioConn{Reader: os.Stdin, Writer: os.Stdout, in: os.Stdin, out: os.Stdout}
+}
+
+func (s *stdioConn) Close() error {
+	_ = s.out.Close()
+	_ = s.in.Close()
+	return nil
+}

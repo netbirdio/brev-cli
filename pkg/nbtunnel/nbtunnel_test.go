@@ -3,13 +3,16 @@ package nbtunnel
 import (
 	"context"
 	"errors"
-	"io"
-	"net"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestParseRegistrationCommand(t *testing.T) {
@@ -55,6 +58,11 @@ func TestParseRegistrationCommand(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "plain http is refused",
+			command: "netbird up --setup-key ABC --management-url http://m.example.com",
+			wantErr: true,
+		},
+		{
 			name:    "invalid management url scheme",
 			command: "netbird up --setup-key ABC --management-url ftp://m.example.com",
 			wantErr: true,
@@ -95,7 +103,7 @@ func TestWaitForPeer(t *testing.T) {
 			// which is what a cold eager connection looks like.
 			return []peerInfo{{ip: "100.73.10.20/16", connected: calls >= 3}}, nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := waitForPeer(ctx, ip, peers); err != nil {
 			t.Fatalf("waitForPeer: %v", err)
@@ -115,8 +123,8 @@ func TestWaitForPeer(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error for a peer outside the map")
 		}
-		if got := err.Error(); !contains(got, "network map") {
-			t.Errorf("error should mention the network map, got %q", got)
+		if !strings.Contains(err.Error(), "network map") {
+			t.Errorf("error should mention the network map, got %q", err)
 		}
 	})
 
@@ -131,64 +139,6 @@ func TestWaitForPeer(t *testing.T) {
 			t.Fatalf("expected a deadline error, got %v", err)
 		}
 	})
-}
-
-func TestListenLoopbackRelaysToDialedTarget(t *testing.T) {
-	// A local echo server stands in for the sshd reached over the overlay.
-	echo, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer echo.Close()
-	go func() {
-		for {
-			c, err := echo.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}()
-		}
-	}()
-
-	var dialed string
-	tun := &Tunnel{
-		dial: func(ctx context.Context, addr string) (net.Conn, error) {
-			dialed = addr
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", echo.Addr().String())
-		},
-	}
-	defer tun.Close()
-
-	local, err := tun.ListenLoopback("100.73.10.20:22")
-	if err != nil {
-		t.Fatalf("ListenLoopback: %v", err)
-	}
-
-	conn, err := net.Dial("tcp", local)
-	if err != nil {
-		t.Fatalf("dial loopback: %v", err)
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write([]byte("SSH-2.0-probe\r\n")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 64)
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if got := string(buf[:n]); got != "SSH-2.0-probe\r\n" {
-		t.Errorf("relayed bytes = %q, want the echoed probe", got)
-	}
-	if dialed != "100.73.10.20:22" {
-		t.Errorf("overlay dial target = %q, want 100.73.10.20:22", dialed)
-	}
 }
 
 func TestOpenWithoutIdentity(t *testing.T) {
@@ -207,7 +157,8 @@ func TestIdentityRoundTrip(t *testing.T) {
 	if err := writeJSON(filepath.Join(dir, identityFile), want); err != nil {
 		t.Fatalf("writeJSON: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, configFile), []byte(`{"PrivateKey":"abc=","WgIface":"wt0"}`), 0o600); err != nil {
+	cfg := `{"PrivateKey":"abc=","ManagementURL":{"Scheme":"https","Host":"m.example.com:443"},"WgIface":"wt0"}`
+	if err := os.WriteFile(filepath.Join(dir, configFile), []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	got, err := readIdentity(dir)
@@ -224,6 +175,10 @@ func TestIdentityRoundTrip(t *testing.T) {
 	if key != "abc=" {
 		t.Errorf("private key = %q, want abc=", key)
 	}
+	mgmt, err := readConfigManagementURL(dir)
+	if err != nil || mgmt != "https://m.example.com:443" {
+		t.Errorf("management url = %q, %v; want https://m.example.com:443", mgmt, err)
+	}
 	if !IsRegistered(dir) {
 		t.Error("IsRegistered should be true once identity and config exist")
 	}
@@ -232,6 +187,83 @@ func TestIdentityRoundTrip(t *testing.T) {
 	}
 	if IsRegistered(dir) {
 		t.Error("IsRegistered should be false after Remove")
+	}
+}
+
+func TestDiscardForeignIdentity(t *testing.T) {
+	writeCfg := func(t *testing.T, dir, host string) {
+		t.Helper()
+		cfg := fmt.Sprintf(`{"PrivateKey":"abc=","ManagementURL":{"Scheme":"https","Host":%q}}`, host)
+		if err := os.WriteFile(filepath.Join(dir, configFile), []byte(cfg), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, stateFile), []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write state: %v", err)
+		}
+	}
+
+	t.Run("same control plane keeps the key", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCfg(t, dir, "m.example.com:443")
+		if err := discardForeignIdentity(dir, "https://m.example.com"); err != nil {
+			t.Fatalf("discardForeignIdentity: %v", err)
+		}
+		if _, err := readPrivateKey(dir); err != nil {
+			t.Errorf("the private key must survive a retry against the same management: %v", err)
+		}
+	})
+
+	t.Run("other control plane starts fresh", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCfg(t, dir, "old.example.com:443")
+		if err := discardForeignIdentity(dir, "https://new.example.com"); err != nil {
+			t.Fatalf("discardForeignIdentity: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, configFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Error("config.json should be removed for a different management URL")
+		}
+		if _, err := os.Stat(filepath.Join(dir, stateFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Error("state.json should be removed for a different management URL")
+		}
+	})
+
+	t.Run("no config is a no-op", func(t *testing.T) {
+		if err := discardForeignIdentity(t.TempDir(), "https://m.example.com"); err != nil {
+			t.Fatalf("discardForeignIdentity: %v", err)
+		}
+	})
+}
+
+func TestSameManagementURL(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"https://m.example.com", "https://m.example.com:443", true},
+		{"https://M.Example.com:443", "https://m.example.com", true},
+		{"https://m.example.com", "https://other.example.com", false},
+		{"https://m.example.com:8443", "https://m.example.com", false},
+	}
+	for _, tt := range tests {
+		if got := sameManagementURL(tt.a, tt.b); got != tt.want {
+			t.Errorf("sameManagementURL(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestStartErrorMapsManagementRefusals(t *testing.T) {
+	refusal := fmt.Errorf("login: %w", status.Error(codes.PermissionDenied, "peer not registered"))
+	err := startError(refusal)
+	if !errors.Is(err, ErrIdentityRejected) {
+		t.Errorf("a PermissionDenied login should map to ErrIdentityRejected, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "peer not registered") {
+		t.Errorf("the raw cause should stay attached, got %v", err)
+	}
+
+	other := startError(errors.New("dial tcp: connection refused"))
+	if errors.Is(other, ErrIdentityRejected) {
+		t.Errorf("a transport failure must not be reported as a rejected identity: %v", other)
 	}
 }
 
@@ -253,15 +285,26 @@ func TestLockIsExclusive(t *testing.T) {
 	unlock2()
 }
 
-func contains(s, sub string) bool {
-	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
+func TestSessionRedirectsStderrAndRestores(t *testing.T) {
+	dir := t.TempDir()
+	before := os.Stderr
+	sess, err := openSession(dir)
+	if err != nil {
+		t.Fatalf("openSession: %v", err)
 	}
-	return -1
+	if os.Stderr == before {
+		t.Error("os.Stderr should point at the tunnel log while a session is open")
+	}
+	fmt.Fprintln(os.Stderr, "engine noise")
+	sess.close()
+	if os.Stderr != before {
+		t.Error("os.Stderr should be restored after close")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, logFile))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(data), "engine noise") {
+		t.Errorf("stderr output should land in the tunnel log, got %q", data)
+	}
 }

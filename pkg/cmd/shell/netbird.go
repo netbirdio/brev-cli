@@ -2,16 +2,15 @@ package shell
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
-	"time"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
 	"connectrpc.com/connect"
+	"github.com/alessio/shellescape"
 
 	"github.com/brevdev/brev-cli/pkg/cmd/refresh"
 	"github.com/brevdev/brev-cli/pkg/cmd/register"
@@ -21,22 +20,20 @@ import (
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
 	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 	"github.com/brevdev/brev-cli/pkg/ssh"
-	"github.com/brevdev/brev-cli/pkg/terminal"
 )
 
-const (
-	defaultSSHPort  = 22
-	tunnelStartWait = 60 * time.Second
-	peerConnectWait = 25 * time.Second
-)
+const defaultSSHPort = 22
 
 // meshTarget is where a Brev machine's sshd listens inside the NetBird overlay,
 // plus the ssh_config alias whose user and certificate hook still apply.
 type meshTarget struct {
-	name      string
-	alias     string
-	addr      netip.Addr
-	port      uint16
+	name  string
+	alias string
+	addr  netip.Addr
+	port  uint16
+	// host selects the plain ssh invocation brev uses for machines rather
+	// than the container shell wrapper it uses for instances.
+	host      bool
 	workspace *entity.Workspace
 }
 
@@ -44,11 +41,12 @@ func (m meshTarget) hostPort() string {
 	return net.JoinHostPort(m.addr.String(), strconv.Itoa(int(m.port)))
 }
 
-// runShellViaNetbird opens the embedded tunnel, waits for the target peer, and
-// execs the system ssh against the usual alias with HostName and Port pointed
-// at a loopback relay into the overlay. Everything else in the alias entry,
-// the user, the mint-cert hook, agent forwarding, keeps working unchanged.
-func runShellViaNetbird(t *terminal.Terminal, sstore ShellStore, nameOrID string, host bool) error {
+// runShellViaNetbird resolves the machine's overlay address and execs the
+// system ssh against the usual alias with the overlay hop supplied as a
+// ProxyCommand (brev nb-proxy), which starts the embedded tunnel for the
+// session. The alias entry is left untouched, so the Match host block that
+// mints the certificate, the user and agent forwarding keep working.
+func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 	if host {
 		return breverrors.NewValidationError("--host cannot be combined with --netbird yet")
 	}
@@ -59,31 +57,18 @@ func runShellViaNetbird(t *terminal.Terminal, sstore ShellStore, nameOrID string
 	if err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
-	tunnel, err := nbtunnel.Open(nbtunnel.Dir(home))
-	if err != nil {
-		if errors.Is(err, nbtunnel.ErrNotRegistered) || errors.Is(err, nbtunnel.ErrLocked) {
-			return breverrors.NewValidationError(err.Error())
-		}
-		return breverrors.WrapAndTrace(err)
+	if !nbtunnel.IsRegistered(nbtunnel.Dir(home)) {
+		return breverrors.NewValidationError(nbtunnel.ErrNotRegistered.Error())
 	}
-	defer tunnel.Close()
 
-	ctx := context.Background()
-	target, err := resolveMeshTarget(ctx, sstore, nameOrID)
+	target, err := resolveMeshTarget(context.Background(), sstore, nameOrID)
 	if err != nil {
 		return err
 	}
-	if err := connectTunnel(ctx, t, tunnel, target); err != nil {
-		return err
-	}
-	local, err := tunnel.ListenLoopback(target.hostPort())
-	if err != nil {
-		return breverrors.WrapAndTrace(err)
-	}
+	opts := netbirdSSHOptions(brevExecutable(), target)
 	_, _ = fmt.Fprintf(os.Stderr, "Resolved SSH target: %s via NetBird %s\n", target.alias, target.hostPort())
 
-	opts := netbirdSSHOptions(local)
-	if err := runSSHWithOptions(target.alias, false, false, opts...); err == nil {
+	if err := runSSHWithOptions(target.alias, target.host, false, opts...); err == nil {
 		trackNetbirdShell(sstore, target)
 		return nil
 	}
@@ -93,7 +78,7 @@ func runShellViaNetbird(t *terminal.Terminal, sstore ShellStore, nameOrID string
 	if err := refresh.RunRefreshAsync(sstore).Await(); err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
-	if err := runSSHWithOptions(target.alias, false, true, opts...); err != nil {
+	if err := runSSHWithOptions(target.alias, target.host, true, opts...); err != nil {
 		return breverrors.WrapAndTrace(err)
 	}
 	trackNetbirdShell(sstore, target)
@@ -106,30 +91,14 @@ func trackNetbirdShell(sstore ShellStore, target meshTarget) {
 	}
 }
 
-func connectTunnel(ctx context.Context, t *terminal.Terminal, tunnel *nbtunnel.Tunnel, target meshTarget) error {
-	s := t.NewSpinner()
-	s.Suffix = " connecting to the Brev tunnel"
-	s.Start()
-	startCtx, cancel := context.WithTimeout(ctx, tunnelStartWait)
-	err := tunnel.Start(startCtx)
-	cancel()
-	s.Stop()
+// brevExecutable returns the running binary for the ProxyCommand, matching
+// how the mint-cert hook is generated.
+func brevExecutable() string {
+	bin, err := os.Executable()
 	if err != nil {
-		return breverrors.NewValidationError(fmt.Sprintf(
-			"could not start the embedded Brev tunnel: %v\n"+
-				"If this device was removed from Brev, run 'brev deregister' and 'brev register --embedded' again.", err))
+		return "brev"
 	}
-
-	s.Suffix = fmt.Sprintf(" waiting for %s to be reachable over NetBird", target.name)
-	s.Start()
-	waitCtx, cancel := context.WithTimeout(ctx, peerConnectWait)
-	err = tunnel.WaitForPeer(waitCtx, target.addr)
-	cancel()
-	s.Stop()
-	if err != nil {
-		return breverrors.NewValidationError(fmt.Sprintf("%s is not reachable over NetBird: %v", target.name, err))
-	}
-	return nil
+	return bin
 }
 
 func resolveMeshTarget(ctx context.Context, sstore ShellStore, nameOrID string) (meshTarget, error) {
@@ -220,6 +189,7 @@ func nodeMeshTarget(ctx context.Context, sstore ShellStore, user *entity.User, n
 		alias: ssh.SanitizeNodeName(node.GetName()),
 		addr:  addr,
 		port:  sshServerPort(full.GetPorts(), entry.PortID),
+		host:  true,
 	}, nil
 }
 
@@ -249,18 +219,18 @@ func sshServerPort(ports []*nodev1.Port, portID string) uint16 {
 	return defaultSSHPort
 }
 
-// netbirdSSHOptions points OpenSSH at the loopback relay while the alias entry
-// keeps supplying the user, the certificate hook and the rest. ControlMaster is
-// off because the relay lives only as long as this brev process.
-func netbirdSSHOptions(localAddr string) []string {
-	host, port, err := net.SplitHostPort(localAddr)
-	if err != nil {
-		host, port = "127.0.0.1", localAddr
-	}
+// netbirdSSHOptions supplies the overlay hop as the ProxyCommand and disables
+// anything in the alias entry that would route around it. HostName is left
+// alone on purpose: OpenSSH evaluates `Match host` against the substituted
+// hostname, so overriding it would skip the block that mints the certificate.
+// ControlMaster is off because the proxy lives only as long as this session,
+// and ConnectTimeout covers the tunnel start and peer wait inside it.
+func netbirdSSHOptions(brevBin string, target meshTarget) []string {
+	proxy := shellescape.QuoteCommand([]string{brevBin, "nb-proxy", target.addr.String(), strconv.Itoa(int(target.port))})
 	return []string{
-		"-o", "HostName=" + host,
-		"-o", "Port=" + port,
-		"-o", "ConnectTimeout=15",
+		"-o", "ProxyCommand=" + proxy,
+		"-o", "ProxyJump=none",
+		"-o", "ConnectTimeout=90",
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=none",
 	}
