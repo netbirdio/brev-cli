@@ -55,8 +55,9 @@ type SetupRunner interface {
 // EmbeddedTunnel enrolls and inspects the NetBird client embedded in brev-cli.
 type EmbeddedTunnel interface {
 	// Register logs in once with the setup key carried by the registration
-	// command and persists the peer identity for later sessions.
-	Register(ctx context.Context, deviceName, registrationCommand string) error
+	// command, waits for the NetBird address, and persists the peer identity
+	// for later sessions.
+	Register(ctx context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error)
 	// IsRegistered reports whether a persisted identity exists.
 	IsRegistered() bool
 }
@@ -71,19 +72,20 @@ func (embeddedTunnel) dir() (string, error) {
 	return nbtunnel.Dir(home), nil
 }
 
-func (e embeddedTunnel) Register(ctx context.Context, deviceName, registrationCommand string) error {
+func (e embeddedTunnel) Register(ctx context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error) {
 	creds, err := nbtunnel.ParseRegistrationCommand(registrationCommand)
 	if err != nil {
-		return fmt.Errorf("parse registration command: %w", err)
+		return nbtunnel.Status{}, fmt.Errorf("parse registration command: %w", err)
 	}
 	dir, err := e.dir()
 	if err != nil {
-		return err
+		return nbtunnel.Status{}, err
 	}
-	if err := nbtunnel.Register(ctx, dir, deviceName, creds); err != nil {
-		return fmt.Errorf("register embedded tunnel: %w", err)
+	st, err := nbtunnel.Register(ctx, dir, deviceName, creds)
+	if err != nil {
+		return st, fmt.Errorf("register embedded tunnel: %w", err)
 	}
-	return nil
+	return st, nil
 }
 
 func (e embeddedTunnel) IsRegistered() bool {
@@ -491,10 +493,9 @@ func runRegisterSteps(ctx context.Context, t *terminal.Terminal, s RegisterStore
 	t.Vprint("")
 	t.Vprint(t.Yellow("[Step 5/5] Connecting device to Brev..."))
 	if embedded {
-		if err := registerEmbeddedTunnel(ctx, node, name, deps); err != nil {
+		if err := registerEmbeddedTunnel(ctx, t, node, name, deps); err != nil {
 			return err
 		}
-		t.Vprintf("%s  Embedded Brev tunnel ready.\n", t.Green("  ✓"))
 	} else {
 		runSetup(node, t, deps)
 	}
@@ -505,6 +506,7 @@ func runRegisterSteps(ctx context.Context, t *terminal.Terminal, s RegisterStore
 	t.Vprint("")
 	if embedded {
 		t.Vprintf("  %s\n", t.Green("To connect to a Brev machine over the tunnel, run: brev ssh --netbird <machine>"))
+		t.Vprintf("  %s\n", t.Green("To check the tunnel and its peers, run: brev tunnel status"))
 	} else {
 		t.Vprintf("  %s\n", t.Green("To enable SSH access to this device, run: brev enable-ssh"))
 	}
@@ -520,15 +522,30 @@ func nodeLabels(embedded bool) map[string]string {
 }
 
 // registerEmbeddedTunnel logs the embedded client in once with the setup key
-// from the node's registration command and persists the resulting identity.
-func registerEmbeddedTunnel(ctx context.Context, node *nodev1.ExternalNode, name string, deps registerDeps) error {
+// from the node's registration command, persists the resulting identity, and
+// shows what Brev's NetBird management handed out.
+func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nodev1.ExternalNode, name string, deps registerDeps) error {
 	ci := node.GetConnectivityInfo()
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return errors.New("brev returned no tunnel registration command; run 'brev register --embedded' again to retry")
 	}
-	if err := deps.tunnel.Register(ctx, name, ci.GetRegistrationCommand()); err != nil {
+	st, err := deps.tunnel.Register(ctx, name, ci.GetRegistrationCommand())
+	if err != nil {
 		return fmt.Errorf("embedded Brev tunnel setup failed (run 'brev register --embedded' again to retry): %w", err)
 	}
+	if !st.Joined() {
+		t.Vprintf("  %s\n", t.Yellow("Warning: the peer registered but received no NetBird address yet: "+st.ManagementError))
+		t.Vprint("  Run 'brev tunnel status' to check again.")
+		return nil
+	}
+	t.Vprintf("%s  Embedded Brev tunnel ready.\n", t.Green("  ✓"))
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "NetBird IP:")), t.BoldBlue(st.IP))
+	if st.FQDN != "" {
+		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "FQDN:")), t.BoldBlue(st.FQDN))
+	}
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Device name:")), t.BoldBlue(st.DeviceName))
+	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Public key:")), t.BoldBlue(st.PubKey))
+	t.Vprintf("  %s %d\n", t.Green(fmt.Sprintf("%-14s", "Peers:")), len(st.Peers))
 	return nil
 }
 
@@ -632,7 +649,8 @@ func checkExistingEmbedded(ctx context.Context, t *terminal.Terminal, s Register
 	if deps.tunnel.IsRegistered() {
 		t.Vprint(t.Green("  Tunnel identity is in place."))
 		t.Vprint("")
-		t.Vprint("  Connect with: brev ssh --netbird <machine>")
+		t.Vprint("  Check it with:  brev tunnel status")
+		t.Vprint("  Connect with:   brev ssh --netbird <machine>")
 		t.Vprint("  Run 'brev deregister' first if you want to re-register.")
 		return nil
 	}
@@ -649,10 +667,9 @@ func checkExistingEmbedded(ctx context.Context, t *terminal.Terminal, s Register
 	if node == nil {
 		return errors.New("brev returned no node for this registration; run 'brev deregister' and register again")
 	}
-	if err := registerEmbeddedTunnel(ctx, node, reg.DisplayName, deps); err != nil {
+	if err := registerEmbeddedTunnel(ctx, t, node, reg.DisplayName, deps); err != nil {
 		return err
 	}
-	t.Vprintf("%s  Embedded Brev tunnel ready.\n", t.Green("  ✓"))
 	t.Vprint("  Connect with: brev ssh --netbird <machine>")
 	return nil
 }

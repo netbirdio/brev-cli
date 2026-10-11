@@ -38,6 +38,7 @@ const (
 
 	startTimeout = 45 * time.Second
 	startGrace   = 15 * time.Second
+	joinTimeout  = 30 * time.Second
 	stopTimeout  = 5 * time.Second
 	peerPoll     = time.Second
 
@@ -99,21 +100,31 @@ func CheckAvailable(dir string) error {
 }
 
 // Register enrolls the device by logging in to management once with the setup
-// key, then stops the client and persists the identity. The setup key itself is
-// never written to disk; later sessions log in with the persisted private key.
+// key, waits for the peer to receive its NetBird address, then stops the client
+// and persists the identity. The returned Status shows what management handed
+// out; Joined is false when the address did not arrive in time, in which case
+// the enrollment is still kept. The setup key itself is never written to disk;
+// later sessions log in with the persisted private key.
+//
+// When Brev's registration command names a hostname, the peer registers under
+// it, exactly as the native netbird client would, so Brev can match the peer to
+// the node it created.
 //
 // A private key left behind by an earlier attempt is reused rather than
 // replaced: management logs a key it already knows straight in and only
 // registers it with the setup key when it does not, so a retry neither spends
 // the key twice nor leaks a peer. Only a different management URL, meaning a
 // different control plane, starts from a fresh key.
-func Register(ctx context.Context, dir, deviceName string, creds Credentials) error {
+func Register(ctx context.Context, dir, deviceName string, creds Credentials) (Status, error) {
+	if creds.Hostname != "" {
+		deviceName = creds.Hostname
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
+		return Status{}, fmt.Errorf("create %s: %w", dir, err)
 	}
 	sess, err := openSession(dir)
 	if err != nil {
-		return err
+		return Status{}, err
 	}
 	defer sess.close()
 
@@ -121,10 +132,10 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 	// without this a failed retry would leave it beside a key management never
 	// accepted, and IsRegistered would report the device as enrolled.
 	if err := os.Remove(filepath.Join(dir, identityFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale %s: %w", identityFile, err)
+		return Status{}, fmt.Errorf("remove stale %s: %w", identityFile, err)
 	}
 	if err := discardForeignIdentity(dir, creds.ManagementURL); err != nil {
-		return err
+		return Status{}, err
 	}
 
 	client, err := newClient(dir, clientOptions{
@@ -133,21 +144,32 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) er
 		setupKey:      creds.SetupKey,
 	}, sess.logFile)
 	if err != nil {
-		return err
+		return Status{}, err
 	}
 	if err := checkManagementURL(client, creds.ManagementURL); err != nil {
-		return err
+		return Status{}, err
 	}
 	if err := startBounded(ctx, client, ErrSetupKeyRejected); err != nil {
-		return err
+		return Status{}, err
 	}
+	joinCtx, cancel := context.WithTimeout(ctx, joinTimeout)
+	st, joinErr := waitForIP(joinCtx, func() (Status, error) { return statusOf(client, deviceName) })
+	cancel()
 	stopClient(client)
+	if joinErr != nil {
+		// Start succeeded, so management knows the key; keep the identity and
+		// let the caller report that the address has not arrived yet.
+		st.ManagementError = joinErr.Error()
+	}
 
-	return writeJSON(filepath.Join(dir, identityFile), Identity{
+	if err := writeJSON(filepath.Join(dir, identityFile), Identity{
 		DeviceName:    deviceName,
 		ManagementURL: creds.ManagementURL,
 		RegisteredAt:  time.Now().UTC().Format(time.RFC3339),
-	})
+	}); err != nil {
+		return st, err
+	}
+	return st, nil
 }
 
 // discardForeignIdentity removes a persisted key and state that belong to

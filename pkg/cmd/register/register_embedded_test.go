@@ -8,6 +8,7 @@ import (
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
 
+	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 	"github.com/brevdev/brev-cli/pkg/terminal"
 )
 
@@ -19,14 +20,14 @@ type mockEmbeddedTunnel struct {
 	calls      int
 }
 
-func (m *mockEmbeddedTunnel) Register(_ context.Context, deviceName, registrationCommand string) error {
+func (m *mockEmbeddedTunnel) Register(_ context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error) {
 	m.calls++
 	m.name, m.command = deviceName, registrationCommand
 	if m.err != nil {
-		return m.err
+		return nbtunnel.Status{}, m.err
 	}
 	m.registered = true
-	return nil
+	return nbtunnel.Status{DeviceName: deviceName, ManagementConnected: true, IP: "100.73.5.6", PubKey: "abc="}, nil
 }
 
 func (m *mockEmbeddedTunnel) IsRegistered() bool { return m.registered }
