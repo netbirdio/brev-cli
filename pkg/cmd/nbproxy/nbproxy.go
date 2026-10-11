@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -71,33 +72,46 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 	// The tunnel redirects os.Stderr into its log while the engine runs; keep
 	// the real one so progress still reaches the user through ssh.
 	stderr := os.Stderr
+	clock := newStopwatch()
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("user home dir: %w", err)
 	}
-	progressf(stderr, "unlocking the Brev tunnel identity")
+	progressf(stderr, "[%s] unlocking the Brev tunnel identity", clock)
 	tunnel, err := tunnelcmd.Open(ctx, store, nbtunnel.Dir(home))
 	if err != nil {
 		return err //nolint:wrapcheck // the tunnel errors already name the remedy
 	}
 	defer tunnel.Close()
+	unlock := clock.lap()
 
-	progressf(stderr, "starting the Brev tunnel")
+	progressf(stderr, "[%s] starting the Brev tunnel", clock)
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	err = tunnel.Start(startCtx)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("%w (details in %s)", err, tunnel.LogPath())
 	}
+	engine := clock.lap()
 
+	link := "unknown"
+	var peerWait time.Duration
 	if addr, perr := netip.ParseAddr(host); perr == nil {
-		progressf(stderr, "waiting for %s to connect over NetBird", host)
+		progressf(stderr, "[%s] waiting for %s to connect over NetBird", clock, host)
 		waitCtx, cancel := context.WithTimeout(ctx, peerTimeout)
 		err = tunnel.WaitForPeer(waitCtx, addr)
 		cancel()
 		if err != nil {
 			return err //nolint:wrapcheck // already names the cause
 		}
+		peerWait = clock.lap()
+		if p, ok := tunnel.PeerLink(addr); ok {
+			link = p.LinkWord()
+			if p.Latency > 0 {
+				link += fmt.Sprintf(", latency %s", p.Latency.Round(time.Millisecond))
+			}
+		}
+		progressf(stderr, "[%s] peer %s connected via %s", clock, host, link)
 	}
 
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
@@ -107,10 +121,64 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 	if err != nil {
 		return fmt.Errorf("dial %s over netbird: %w", target, err)
 	}
-	progressf(stderr, "connected to %s over NetBird", target)
+	dial := clock.lap()
+	summary := fmt.Sprintf("connected to %s over NetBird after %s (unlock %s, engine start %s, peer connect %s via %s, dial %s)",
+		target, clock, fmtDur(unlock), fmtDur(engine), fmtDur(peerWait), link, fmtDur(dial))
+	progressf(stderr, "[%s] %s", clock, summary)
+	// os.Stderr is the tunnel log while the engine runs; keep the breakdown
+	// there too, next to the engine's own timestamps.
+	progressf(os.Stderr, "timing: %s", summary)
 
-	netrelay.Relay(ctx, newStdioConn(), conn, netrelay.Options{})
+	// The first bytes back are sshd's banner: from here on the overlay path
+	// carries the session and what remains is the ssh handshake itself.
+	remote := &firstByteConn{Conn: conn, onFirst: func(n int) {
+		progressf(stderr, "[%s] first %d bytes from %s (sshd banner); the ssh handshake runs from here", clock, n, target)
+	}}
+	netrelay.Relay(ctx, newStdioConn(), remote, netrelay.Options{})
 	return nil
+}
+
+// stopwatch stamps progress lines with the time since nb-proxy started and
+// measures the laps between the connection phases.
+type stopwatch struct {
+	start time.Time
+	last  time.Time
+}
+
+func newStopwatch() *stopwatch {
+	now := time.Now()
+	return &stopwatch{start: now, last: now}
+}
+
+// lap returns the time since the previous lap (or the start).
+func (s *stopwatch) lap() time.Duration {
+	now := time.Now()
+	d := now.Sub(s.last)
+	s.last = now
+	return d
+}
+
+func (s *stopwatch) String() string {
+	return "+" + fmtDur(time.Since(s.start))
+}
+
+func fmtDur(d time.Duration) string {
+	return d.Round(10 * time.Millisecond).String()
+}
+
+// firstByteConn reports the first successful read from the remote once.
+type firstByteConn struct {
+	net.Conn
+	once    sync.Once
+	onFirst func(n int)
+}
+
+func (c *firstByteConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.once.Do(func() { c.onFirst(n) })
+	}
+	return n, err //nolint:wrapcheck // io.EOF must reach the relay unwrapped
 }
 
 func progressf(w io.Writer, format string, args ...any) {

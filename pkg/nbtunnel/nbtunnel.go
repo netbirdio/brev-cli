@@ -272,6 +272,33 @@ func (t *Tunnel) WaitForPeer(ctx context.Context, ip netip.Addr) error {
 	return waitForPeer(ctx, ip, t.peers)
 }
 
+// PeerLink reports how the peer at ip is connected right now, for timing and
+// diagnostics; ok is false when the peer is not in the network map.
+func (t *Tunnel) PeerLink(ip netip.Addr) (link PeerStatus, ok bool) {
+	st, err := t.Status()
+	if err != nil {
+		return PeerStatus{}, false
+	}
+	for _, p := range st.Peers {
+		if sameAddr(p.IP, ip) {
+			return p, true
+		}
+	}
+	return PeerStatus{}, false
+}
+
+// LinkWord names the path a connected peer uses, for a progress line.
+func (p PeerStatus) LinkWord() string {
+	switch {
+	case !p.Connected:
+		return p.Status
+	case p.Relayed:
+		return "relay"
+	default:
+		return "direct"
+	}
+}
+
 // Dial opens a TCP connection to addr over the overlay.
 func (t *Tunnel) Dial(ctx context.Context, addr string) (net.Conn, error) {
 	return t.dial(ctx, addr)

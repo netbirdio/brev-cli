@@ -129,25 +129,31 @@ func runStatus(ctx context.Context, store externalnode.TokenProvider, keep time.
 	}
 	dir := nbtunnel.Dir(home)
 	fmt.Fprintln(stderr, "Unlocking the tunnel identity with the current Brev session ...")
+	started := time.Now()
 	tunnel, err := Open(ctx, store, dir)
 	if err != nil {
 		return breverrors.NewValidationError(err.Error())
 	}
 	defer tunnel.Close()
+	fmt.Fprintf(stderr, "Unlocked in %s (Brev API round trip included).\n", time.Since(started).Round(10*time.Millisecond))
 
 	id := tunnel.Identity()
 	fmt.Fprintf(stderr, "Starting the embedded Brev tunnel as %s (node %s) against %s ...\n", id.DeviceName, id.NodeID, id.ManagementURL)
+	startAt := time.Now()
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	err = tunnel.Start(startCtx)
 	cancel()
 	if err != nil {
 		return breverrors.NewValidationError(fmt.Sprintf("%v (details in %s)", err, tunnel.LogPath()))
 	}
+	fmt.Fprintf(stderr, "Engine started in %s (management login, signal, network map).\n", time.Since(startAt).Round(10*time.Millisecond))
 
 	fmt.Fprintln(stderr, "Waiting for a NetBird address ...")
+	joinAt := time.Now()
 	joinCtx, cancel := context.WithTimeout(ctx, joinTimeout)
 	st, joinErr := tunnel.WaitForIP(joinCtx)
 	cancel()
+	fmt.Fprintf(stderr, "Address after %s; %s since start.\n\n", time.Since(joinAt).Round(10*time.Millisecond), time.Since(started).Round(10*time.Millisecond))
 	fmt.Fprint(os.Stdout, st.Format(time.Now()))
 	if joinErr != nil {
 		return breverrors.NewValidationError(fmt.Sprintf("%v (details in %s)", joinErr, tunnel.LogPath()))

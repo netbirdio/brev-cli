@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
 	"connectrpc.com/connect"
@@ -81,19 +82,24 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 	}
 
 	ctx := context.Background()
+	started := time.Now()
 	target, err := resolveMeshTarget(ctx, sstore, nameOrID)
 	if err != nil {
 		return err
 	}
+	lookup := time.Since(started)
 	// A live control master for this alias means ssh will multiplex over the
 	// running tunnel and spawn no second proxy, so the identity lock is fine
 	// and nb-proxy will not have to unlock the identity again.
-	if !controlMasterAlive(target.alias) {
+	var unlock time.Duration
+	reused := controlMasterAlive(target.alias)
+	if !reused {
 		if err := nbtunnel.CheckAvailable(dir); err != nil {
 			return breverrors.NewValidationError(err.Error())
 		}
 		// Prove the Brev session unlocks the identity while the terminal is
 		// still ours: inside the ProxyCommand the same failure is a bare 255.
+		unlockStart := time.Now()
 		creds, err := tunnel.Credentials(ctx, sstore, id)
 		if err != nil {
 			return breverrors.NewValidationError(err.Error())
@@ -101,13 +107,20 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 		if err := nbtunnel.CheckUnlock(dir, creds); err != nil {
 			return breverrors.NewValidationError(err.Error())
 		}
+		unlock = time.Since(unlockStart)
 	}
+	configStart := time.Now()
 	if err := ensureAliasConfigured(sstore, files.GetBrevSSHConfigPath(home), target.alias); err != nil {
 		return err
 	}
+	sshConfig := time.Since(configStart)
 
 	opts := netbirdSSHOptions(brevExecutable(), target)
-	_, _ = fmt.Fprintf(os.Stderr, "Resolved SSH target: %s via NetBird %s\n", target.alias, target.hostPort())
+	_, _ = fmt.Fprintf(os.Stderr, "Resolved SSH target: %s via NetBird %s (brev api: target lookup %s, identity unlock %s, ssh config %s; %s before ssh)\n",
+		target.alias, target.hostPort(), lookup.Round(10*time.Millisecond), unlockWord(unlock, reused), sshConfig.Round(10*time.Millisecond), time.Since(started).Round(10*time.Millisecond))
+	if reused {
+		_, _ = fmt.Fprintln(os.Stderr, "Reusing the live tunnel of a previous session (ssh ControlMaster); nb-proxy is not started again.")
+	}
 	if err := runSSHWithOptions(target.alias, target.host, false, opts...); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() != sshFailureExit {
@@ -122,6 +135,13 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 		trackShellAnalytics(sstore, target.workspace)
 	}
 	return nil
+}
+
+func unlockWord(d time.Duration, reused bool) string {
+	if reused {
+		return "skipped"
+	}
+	return d.Round(10 * time.Millisecond).String()
 }
 
 // ensureAliasConfigured regenerates ~/.brev/ssh_config when the alias is not
