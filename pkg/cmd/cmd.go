@@ -368,7 +368,9 @@ func createCmdTree(cmd *cobra.Command, t *terminal.Terminal, loginCmdStore *stor
 	cmd.AddCommand(background.NewCmdBackground(t, loginCmdStore))
 	cmd.AddCommand(status.NewCmdStatus(t, loginCmdStore))
 	cmd.AddCommand(sshkeys.NewCmdSSHKeys(t, loginCmdStore))
-	cmd.AddCommand(nbproxy.NewCmdNBProxy())
+	// nb-proxy runs under ssh with the terminal in raw mode, so it must never
+	// start an interactive login; an expired session is an error there.
+	cmd.AddCommand(nbproxy.NewCmdNBProxy(noLoginCmdStore))
 	cmd.AddCommand(tunnel.NewCmdTunnel(loginCmdStore))
 	cmd.AddCommand(start.NewCmdStart(t, loginCmdStore, noLoginCmdStore))
 	cmd.AddCommand(stop.NewCmdStop(t, loginCmdStore, noLoginCmdStore))

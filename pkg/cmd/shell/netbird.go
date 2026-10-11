@@ -19,6 +19,7 @@ import (
 
 	"github.com/brevdev/brev-cli/pkg/cmd/refresh"
 	"github.com/brevdev/brev-cli/pkg/cmd/register"
+	"github.com/brevdev/brev-cli/pkg/cmd/tunnel"
 	"github.com/brevdev/brev-cli/pkg/cmd/util"
 	"github.com/brevdev/brev-cli/pkg/config"
 	"github.com/brevdev/brev-cli/pkg/entity"
@@ -74,18 +75,30 @@ func runShellViaNetbird(sstore ShellStore, nameOrID string, host bool) error {
 		return breverrors.WrapAndTrace(err)
 	}
 	dir := nbtunnel.Dir(home)
-	if !nbtunnel.IsRegistered(dir) {
-		return breverrors.NewValidationError(nbtunnel.ErrNotRegistered.Error())
+	id, err := nbtunnel.ReadIdentity(dir)
+	if err != nil {
+		return breverrors.NewValidationError(err.Error())
 	}
 
-	target, err := resolveMeshTarget(context.Background(), sstore, nameOrID)
+	ctx := context.Background()
+	target, err := resolveMeshTarget(ctx, sstore, nameOrID)
 	if err != nil {
 		return err
 	}
 	// A live control master for this alias means ssh will multiplex over the
-	// running tunnel and spawn no second proxy, so the identity lock is fine.
+	// running tunnel and spawn no second proxy, so the identity lock is fine
+	// and nb-proxy will not have to unlock the identity again.
 	if !controlMasterAlive(target.alias) {
 		if err := nbtunnel.CheckAvailable(dir); err != nil {
+			return breverrors.NewValidationError(err.Error())
+		}
+		// Prove the Brev session unlocks the identity while the terminal is
+		// still ours: inside the ProxyCommand the same failure is a bare 255.
+		creds, err := tunnel.Credentials(ctx, sstore, id)
+		if err != nil {
+			return breverrors.NewValidationError(err.Error())
+		}
+		if err := nbtunnel.CheckUnlock(dir, creds); err != nil {
 			return breverrors.NewValidationError(err.Error())
 		}
 	}

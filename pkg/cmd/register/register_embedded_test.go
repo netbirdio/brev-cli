@@ -14,15 +14,16 @@ import (
 
 type mockEmbeddedTunnel struct {
 	registered bool
+	nodeID     string
 	name       string
 	command    string
 	err        error
 	calls      int
 }
 
-func (m *mockEmbeddedTunnel) Register(_ context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error) {
+func (m *mockEmbeddedTunnel) Register(_ context.Context, nodeID, deviceName, registrationCommand string) (nbtunnel.Status, error) {
 	m.calls++
-	m.name, m.command = deviceName, registrationCommand
+	m.nodeID, m.name, m.command = nodeID, deviceName, registrationCommand
 	if m.err != nil {
 		return nbtunnel.Status{}, m.err
 	}
@@ -64,8 +65,8 @@ func Test_runRegister_Embedded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runRegister: %v", err)
 	}
-	if tunnel.calls != 1 || tunnel.name != "my-laptop" || tunnel.command != "netbird up --key abc" {
-		t.Errorf("tunnel registration = %+v, want one call for my-laptop with the AddNode command", tunnel)
+	if tunnel.calls != 1 || tunnel.nodeID != "unode_abc" || tunnel.name != "my-laptop" || tunnel.command != "netbird up --key abc" {
+		t.Errorf("tunnel registration = %+v, want one call for node unode_abc / my-laptop with the AddNode command", tunnel)
 	}
 	if setupRunner.called {
 		t.Error("the native setup command must not run in embedded mode")
@@ -127,8 +128,8 @@ func Test_runRegister_Embedded_ReenrollsMissingIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runRegister: %v", err)
 	}
-	if tunnel.calls != 1 || !strings.Contains(tunnel.command, "fresh") {
-		t.Errorf("expected one re-enrollment with the node's current command, got %+v", tunnel)
+	if tunnel.calls != 1 || tunnel.nodeID != "unode_abc" || !strings.Contains(tunnel.command, "fresh") {
+		t.Errorf("expected one re-enrollment of node unode_abc with its current command, got %+v", tunnel)
 	}
 }
 

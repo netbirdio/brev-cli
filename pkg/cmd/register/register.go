@@ -56,8 +56,8 @@ type SetupRunner interface {
 type EmbeddedTunnel interface {
 	// Register logs in once with the setup key carried by the registration
 	// command, waits for the NetBird address, and persists the peer identity
-	// for later sessions.
-	Register(ctx context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error)
+	// for later sessions, sealed under that setup key and tied to nodeID.
+	Register(ctx context.Context, nodeID, deviceName, registrationCommand string) (nbtunnel.Status, error)
 	// IsRegistered reports whether a persisted identity exists.
 	IsRegistered() bool
 	// LogPath is where the embedded client writes its log.
@@ -74,7 +74,7 @@ func (embeddedTunnel) dir() (string, error) {
 	return nbtunnel.Dir(home), nil
 }
 
-func (e embeddedTunnel) Register(ctx context.Context, deviceName, registrationCommand string) (nbtunnel.Status, error) {
+func (e embeddedTunnel) Register(ctx context.Context, nodeID, deviceName, registrationCommand string) (nbtunnel.Status, error) {
 	creds, err := nbtunnel.ParseRegistrationCommand(registrationCommand)
 	if err != nil {
 		return nbtunnel.Status{}, fmt.Errorf("parse registration command: %w", err)
@@ -83,7 +83,7 @@ func (e embeddedTunnel) Register(ctx context.Context, deviceName, registrationCo
 	if err != nil {
 		return nbtunnel.Status{}, err
 	}
-	st, err := nbtunnel.Register(ctx, dir, deviceName, creds)
+	st, err := nbtunnel.Register(ctx, dir, nodeID, deviceName, creds)
 	if err != nil {
 		return st, fmt.Errorf("register embedded tunnel: %w", err)
 	}
@@ -167,7 +167,9 @@ login-link flow is used.
 Embedded tunnel: with --embedded nothing is installed and no sudo is needed.
 The NetBird client built into brev runs only while 'brev ssh --netbird' is
 connecting, so the device can reach Brev machines over the tunnel but cannot
-be an SSH target itself. Works on Linux and macOS.`
+be an SSH target itself. Its keys are stored sealed under the setup key Brev
+issues for the node, which only a logged-in brev can fetch, so starting the
+tunnel always needs a valid Brev login. Works on Linux and macOS.`
 
 	registerExample = `  # Interactive (prompts for device name, org, confirmations)
   brev register
@@ -539,19 +541,21 @@ func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nod
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return errors.New("brev returned no tunnel registration command; run 'brev register --embedded' again to retry")
 	}
-	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Command:")), ci.GetRegistrationCommand())
+	// The setup key now also unlocks the sealed identity, so only its
+	// fingerprint is shown here; 'brev tunnel registration-command' prints it.
 	if creds, err := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); err == nil {
 		hostname := creds.Hostname
 		if hostname == "" {
 			hostname = name
 		}
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Setup key:")), t.BoldBlue(creds.SetupKey))
+		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Node:")), node.GetExternalNodeId())
+		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Setup key:")), creds.KeyFingerprint())
 		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Management:")), creds.ManagementURL)
 		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Hostname:")), hostname)
 		t.Vprintf("  %s %s (netbird %s), %s\n", t.Green(fmt.Sprintf("%-14s", "Client:")), "embedded", nbtunnel.ClientVersion(), time.Now().UTC().Format(time.RFC3339))
 	}
 	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Log:")), deps.tunnel.LogPath())
-	st, err := deps.tunnel.Register(ctx, name, ci.GetRegistrationCommand())
+	st, err := deps.tunnel.Register(ctx, node.GetExternalNodeId(), name, ci.GetRegistrationCommand())
 	if err != nil {
 		return fmt.Errorf("embedded Brev tunnel setup failed (run 'brev register --embedded' again to retry): %w", err)
 	}

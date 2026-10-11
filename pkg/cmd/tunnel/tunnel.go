@@ -53,7 +53,7 @@ together with the peers in its network map and their connection state.`,
   # Print the 'netbird up' command Brev issued for this device (includes the setup key)
   brev tunnel registration-command`,
 	}
-	cmd.AddCommand(newCmdStatus())
+	cmd.AddCommand(newCmdStatus(store))
 	cmd.AddCommand(newCmdRegistrationCommand(store))
 	return cmd
 }
@@ -66,7 +66,8 @@ func newCmdRegistrationCommand(store externalnode.TokenProvider) *cobra.Command 
 		Short:                 "Print the 'netbird up' command Brev issued for this device, setup key included",
 		Long: `Fetches the registration command Brev's API currently returns for the node this
 device registered as with 'brev register --embedded'. It contains the setup key,
-so treat the output as a secret. Useful to run the native netbird client with the
+which also unlocks this device's sealed tunnel identity, so treat the output as
+a secret. Useful to run the native netbird client with the
 same credentials when comparing it with the embedded one.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -91,7 +92,7 @@ func runRegistrationCommand(ctx context.Context, store externalnode.TokenProvide
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return breverrors.NewValidationError(fmt.Sprintf("Brev returned no registration command for node %s", reg.ExternalNodeID))
 	}
-	fmt.Fprintf(os.Stderr, "Node %s (%s); the command below contains the setup key, do not share it.\n", reg.DisplayName, reg.ExternalNodeID)
+	fmt.Fprintf(os.Stderr, "Node %s (%s); the command below contains the setup key that also unlocks this device's tunnel identity; do not share it.\n", reg.DisplayName, reg.ExternalNodeID)
 	fmt.Fprintln(os.Stdout, ci.GetRegistrationCommand())
 	if creds, perr := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); perr == nil {
 		fmt.Fprintf(os.Stderr, "Setup key: %s\nManagement: %s\n", creds.SetupKey, creds.ManagementURL)
@@ -99,7 +100,7 @@ func runRegistrationCommand(ctx context.Context, store externalnode.TokenProvide
 	return nil
 }
 
-func newCmdStatus() *cobra.Command {
+func newCmdStatus(store externalnode.TokenProvider) *cobra.Command {
 	var keep time.Duration
 	cmd := &cobra.Command{
 		Annotations:           map[string]string{"configuration": ""},
@@ -108,14 +109,14 @@ func newCmdStatus() *cobra.Command {
 		Short:                 "Bring the embedded tunnel up and show its NetBird address and peers",
 		Args:                  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStatus(cmd.Context(), keep)
+			return runStatus(cmd.Context(), store, keep)
 		},
 	}
 	cmd.Flags().DurationVar(&keep, "keep", 0, "stay connected this long after the first report, reprinting the peers when they change (for example 5m); Ctrl-C stops earlier")
 	return cmd
 }
 
-func runStatus(ctx context.Context, keep time.Duration) error {
+func runStatus(ctx context.Context, store externalnode.TokenProvider, keep time.Duration) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -127,17 +128,15 @@ func runStatus(ctx context.Context, keep time.Duration) error {
 		return breverrors.WrapAndTrace(err)
 	}
 	dir := nbtunnel.Dir(home)
-	if !nbtunnel.IsRegistered(dir) {
-		return breverrors.NewValidationError(nbtunnel.ErrNotRegistered.Error())
-	}
-	tunnel, err := nbtunnel.Open(dir)
+	fmt.Fprintln(stderr, "Unlocking the tunnel identity with the current Brev session ...")
+	tunnel, err := Open(ctx, store, dir)
 	if err != nil {
 		return breverrors.NewValidationError(err.Error())
 	}
 	defer tunnel.Close()
 
 	id := tunnel.Identity()
-	fmt.Fprintf(stderr, "Starting the embedded Brev tunnel as %s against %s ...\n", id.DeviceName, id.ManagementURL)
+	fmt.Fprintf(stderr, "Starting the embedded Brev tunnel as %s (node %s) against %s ...\n", id.DeviceName, id.NodeID, id.ManagementURL)
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	err = tunnel.Start(startCtx)
 	cancel()

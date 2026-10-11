@@ -22,7 +22,9 @@ import (
 	"github.com/netbirdio/netbird/util/netrelay"
 	"github.com/spf13/cobra"
 
+	tunnelcmd "github.com/brevdev/brev-cli/pkg/cmd/tunnel"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/externalnode"
 	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 )
 
@@ -32,8 +34,10 @@ const (
 	dialTimeout  = 20 * time.Second
 )
 
-// NewCmdNBProxy returns the hidden ProxyCommand backend.
-func NewCmdNBProxy() *cobra.Command {
+// NewCmdNBProxy returns the hidden ProxyCommand backend. store supplies the
+// Brev session that unlocks the tunnel identity; it must not start an
+// interactive login, since stdio belongs to ssh here.
+func NewCmdNBProxy(store externalnode.TokenProvider) *cobra.Command {
 	return &cobra.Command{
 		Annotations:           map[string]string{"hidden": ""},
 		Hidden:                true,
@@ -48,7 +52,7 @@ func NewCmdNBProxy() *cobra.Command {
 			}
 			// Every failure here is a tunnel condition the user can act on, not
 			// a crash: report it plainly and keep it out of error telemetry.
-			if err := run(cmd.Context(), args[0], uint16(port)); err != nil {
+			if err := run(cmd.Context(), store, args[0], uint16(port)); err != nil {
 				return breverrors.NewValidationError("Brev tunnel: " + err.Error())
 			}
 			return nil
@@ -56,7 +60,7 @@ func NewCmdNBProxy() *cobra.Command {
 	}
 }
 
-func run(ctx context.Context, host string, port uint16) error {
+func run(ctx context.Context, store externalnode.TokenProvider, host string, port uint16) error {
 	// ssh ends the session by closing our pipes and sending SIGHUP; turn that
 	// into a context cancel so the relay returns and the engine is stopped.
 	// A write to a pipe ssh already closed must surface as EPIPE, not kill us.
@@ -71,7 +75,8 @@ func run(ctx context.Context, host string, port uint16) error {
 	if err != nil {
 		return fmt.Errorf("user home dir: %w", err)
 	}
-	tunnel, err := nbtunnel.Open(nbtunnel.Dir(home))
+	progressf(stderr, "unlocking the Brev tunnel identity")
+	tunnel, err := tunnelcmd.Open(ctx, store, nbtunnel.Dir(home))
 	if err != nil {
 		return err //nolint:wrapcheck // the tunnel errors already name the remedy
 	}
