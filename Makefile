@@ -5,7 +5,7 @@ VERSION := dev-$(shell git rev-parse HEAD | cut -c 1-8)
 NETBIRD_VERSION := $(shell go list -m -f '{{.Version}}' github.com/netbirdio/netbird 2>/dev/null | sed -E 's/^v//; s/-.*$$//')
 LDFLAGS := -X github.com/brevdev/brev-cli/pkg/cmd/version.Version=$(VERSION) -X github.com/netbirdio/netbird/version.version=$(NETBIRD_VERSION)
 
-# Cross-compilation via Docker (golang:1.25 native Linux container).
+# Cross-compilation via Docker (golang:1.26 native Linux container).
 # When arch=<GOOS>/<GOARCH> is provided, spin up a container that matches
 # the target platform so CGO uses the native Linux gcc/GNU ld toolchain
 _GOMODCACHE := $(shell go env GOMODCACHE)
@@ -20,7 +20,7 @@ ifdef arch
     -e GOPRIVATE=github.com/brevdev/* \
     -e GONOSUMDB=github.com/brevdev/* \
     -w /app \
-    golang:1.25
+    golang:1.26
 else
   _BUILD_PREFIX := CGO_ENABLED=1
 endif
