@@ -346,7 +346,7 @@ func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opt
 		if reg.Status == RegistrationStatusPending {
 			return resumeRegistration(ctx, t, s, deps, reg, opts)
 		}
-		return checkExistingRegistration(ctx, t, s, deps, reg, opts)
+		return checkExistingRegistration(ctx, t, s, deps, reg)
 	}
 
 	name := opts.name
@@ -622,7 +622,7 @@ func orgMismatchError(reg *DeviceRegistration, intended *entity.Organization) er
 		existing, reg.OrgName, reg.OrgID, intended.Name, intended.ID))
 }
 
-func checkExistingRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration, opts registerOpts) error {
+func checkExistingRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration) error {
 	if reg.Embedded {
 		return checkExistingEmbedded(ctx, t, s, deps, reg)
 	}
