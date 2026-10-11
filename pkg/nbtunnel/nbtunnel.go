@@ -21,6 +21,7 @@ import (
 	"time"
 
 	netbird "github.com/netbirdio/netbird/client/embed"
+	nbversion "github.com/netbirdio/netbird/version"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -56,7 +57,16 @@ var (
 	// ErrSetupKeyRejected means management refused the setup key Brev handed
 	// out, for example because it was already used or has expired.
 	ErrSetupKeyRejected = errors.New("Brev's tunnel setup key was refused; run 'brev deregister' and then 'brev register --embedded' again to get a new one")
+	// ErrManagementInternal means management accepted the credentials but
+	// failed on its own side; only its log says why.
+	ErrManagementInternal = errors.New("Brev's NetBird management failed internally while handling this peer (the credentials were accepted up to that point); ask Brev to check the management log for 'got an unhandled error' at the time of this attempt")
 )
+
+// ClientVersion is the NetBird version the embedded client reports to
+// management. It reads "development" unless the build set it.
+func ClientVersion() string {
+	return nbversion.NetbirdVersion()
+}
 
 // Dir returns the directory holding the embedded tunnel identity for userHome.
 func Dir(userHome string) string {
@@ -149,6 +159,8 @@ func Register(ctx context.Context, dir, deviceName string, creds Credentials) (S
 	if err := checkManagementURL(client, creds.ManagementURL); err != nil {
 		return Status{}, err
 	}
+	fmt.Fprintf(sess.logFile, "brev: enrolling hostname=%q management=%s setup-key=%s client-version=%s at %s\n",
+		deviceName, creds.ManagementURL, creds.KeyFingerprint(), ClientVersion(), time.Now().UTC().Format(time.RFC3339))
 	if err := startBounded(ctx, client, ErrSetupKeyRejected); err != nil {
 		return Status{}, err
 	}
@@ -496,11 +508,15 @@ func startBounded(ctx context.Context, client *netbird.Client, refusal error) er
 }
 
 // startError turns a management refusal into the actionable refusal error for
-// the credential in use, keeping the raw error attached.
+// the credential in use, keeping the raw error attached. An Internal code is
+// management's catch-all for an unhandled error on its side, so it is named as
+// such rather than blamed on the credential.
 func startError(err, refusal error) error {
 	switch grpcCode(err) {
-	case codes.PermissionDenied, codes.Unauthenticated, codes.InvalidArgument, codes.NotFound:
+	case codes.PermissionDenied, codes.Unauthenticated, codes.InvalidArgument, codes.NotFound, codes.FailedPrecondition:
 		return fmt.Errorf("%w: %v", refusal, err)
+	case codes.Internal:
+		return fmt.Errorf("%w: %v", ErrManagementInternal, err)
 	default:
 		return fmt.Errorf("start embedded netbird client: %w", err)
 	}

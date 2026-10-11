@@ -529,6 +529,14 @@ func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nod
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return errors.New("brev returned no tunnel registration command; run 'brev register --embedded' again to retry")
 	}
+	if creds, err := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); err == nil {
+		hostname := creds.Hostname
+		if hostname == "" {
+			hostname = name
+		}
+		t.Vprintf("  Enrolling %s with NetBird management %s (setup key %s, client %s) at %s\n",
+			hostname, creds.ManagementURL, creds.KeyFingerprint(), nbtunnel.ClientVersion(), time.Now().UTC().Format(time.RFC3339))
+	}
 	st, err := deps.tunnel.Register(ctx, name, ci.GetRegistrationCommand())
 	if err != nil {
 		return fmt.Errorf("embedded Brev tunnel setup failed (run 'brev register --embedded' again to retry): %w", err)

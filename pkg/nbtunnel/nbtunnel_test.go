@@ -282,6 +282,23 @@ func TestStartErrorMapsManagementRefusals(t *testing.T) {
 	if errors.Is(other, ErrIdentityRejected) {
 		t.Errorf("a transport failure must not be reported as a rejected identity: %v", other)
 	}
+
+	// management's catch-all for an unhandled error on its side
+	internal := fmt.Errorf("login: %w", status.Error(codes.Internal, "failed handling request"))
+	err = startError(internal, ErrSetupKeyRejected)
+	if !errors.Is(err, ErrManagementInternal) || errors.Is(err, ErrSetupKeyRejected) {
+		t.Errorf("an Internal code must be reported as a management-side failure, got %v", err)
+	}
+}
+
+func TestKeyFingerprint(t *testing.T) {
+	c := Credentials{SetupKey: "7f1c2a3b-9d4e-4f5a-8b6c-0123456789ab"}
+	if got := c.KeyFingerprint(); got != "7f1c2a3b..." {
+		t.Errorf("fingerprint = %q", got)
+	}
+	if got := (Credentials{SetupKey: "short"}).KeyFingerprint(); got != "short" {
+		t.Errorf("short key fingerprint = %q", got)
+	}
 }
 
 func TestCheckAvailable(t *testing.T) {

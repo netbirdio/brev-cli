@@ -17,6 +17,16 @@ type Credentials struct {
 
 var errUnexpectedCommand = errors.New("unexpected registration command from Brev (expected 'netbird up ...')")
 
+// KeyFingerprint returns enough of the setup key to match it against Brev's
+// records without revealing it.
+func (c Credentials) KeyFingerprint() string {
+	const keep = 8
+	if len(c.SetupKey) <= keep {
+		return c.SetupKey
+	}
+	return c.SetupKey[:keep] + "..."
+}
+
 type credentialField int
 
 const (
