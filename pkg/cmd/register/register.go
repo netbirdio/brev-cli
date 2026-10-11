@@ -182,6 +182,7 @@ func NewCmdRegister(t *terminal.Terminal, store RegisterStore) *cobra.Command {
 	var approveFlag bool
 	var registrationTokenFlag string
 	var embeddedFlag bool
+	var showSetupKeyFlag bool
 
 	cmd := &cobra.Command{
 		Annotations:           map[string]string{"configuration": "", "external-node-auth": ""},
@@ -208,6 +209,7 @@ func NewCmdRegister(t *terminal.Terminal, store RegisterStore) *cobra.Command {
 				skipConfirm:       approveFlag,
 				registrationToken: registrationTokenFlag,
 				embedded:          embeddedFlag,
+				showSetupKey:      showSetupKeyFlag,
 			}
 			return runRegister(cmd.Context(), t, store, opts, defaultRegisterDeps())
 		},
@@ -215,6 +217,7 @@ func NewCmdRegister(t *terminal.Terminal, store RegisterStore) *cobra.Command {
 
 	cmd.Flags().StringVarP(&nameFlag, "name", "n", "", "device name (required when using non-interactive mode)")
 	cmd.Flags().BoolVar(&embeddedFlag, "embedded", false, "use the NetBird client embedded in brev: nothing installed, no sudo; this device can connect with 'brev ssh --netbird' but cannot be an SSH target")
+	cmd.Flags().BoolVar(&showSetupKeyFlag, "show-setup-key", false, "with --embedded, print the full 'netbird up' registration command Brev returned, including the setup key (a secret; printed to the terminal only)")
 	cmd.Flags().IntVarP(&sshPort, "ssh-port", "p", 0, "SSH port (if ssh access is desired)")
 	cmd.Flags().BoolVar(&approveFlag, "approve", false, "skip all confirmation prompts (assume yes)")
 	cmd.Flags().StringVar(&registrationTokenFlag, "registration-token", "", "optional registration token passed to the register node API")
@@ -231,6 +234,7 @@ type registerOpts struct {
 	skipConfirm       bool
 	registrationToken string
 	embedded          bool
+	showSetupKey      bool
 }
 
 // prepareMode applies the differences between the native and the embedded
@@ -334,9 +338,9 @@ func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opt
 			return orgMismatchError(reg, intendedOrg)
 		}
 		if reg.Status == RegistrationStatusPending {
-			return resumeRegistration(ctx, t, s, deps, reg, opts.registrationToken)
+			return resumeRegistration(ctx, t, s, deps, reg, opts)
 		}
-		return checkExistingRegistration(ctx, t, s, deps, reg)
+		return checkExistingRegistration(ctx, t, s, deps, reg, opts)
 	}
 
 	name := opts.name
@@ -398,11 +402,11 @@ func runRegister(ctx context.Context, t *terminal.Terminal, s RegisterStore, opt
 
 	// Generate the device ID here so a retry reuses it (AddNode is idempotent on device_id).
 	deviceID := uuid.New().String()
-	return runRegisterSteps(ctx, t, s, name, org, deps, deviceID, opts.registrationToken, opts.embedded)
+	return runRegisterSteps(ctx, t, s, name, org, deps, deviceID, opts.registrationToken, opts.embedded, opts.showSetupKey)
 }
 
 // runRegisterSteps runs tunnel install, hardware profile, AddNode, persist, and setup
-func runRegisterSteps(ctx context.Context, t *terminal.Terminal, s RegisterStore, name string, org *entity.Organization, deps registerDeps, deviceID, registrationToken string, embedded bool) error { //nolint:funlen // registration flow
+func runRegisterSteps(ctx context.Context, t *terminal.Terminal, s RegisterStore, name string, org *entity.Organization, deps registerDeps, deviceID, registrationToken string, embedded, showSetupKey bool) error { //nolint:funlen // registration flow
 	t.Vprint("")
 
 	if embedded {
@@ -493,7 +497,7 @@ func runRegisterSteps(ctx context.Context, t *terminal.Terminal, s RegisterStore
 	t.Vprint("")
 	t.Vprint(t.Yellow("[Step 5/5] Connecting device to Brev..."))
 	if embedded {
-		if err := registerEmbeddedTunnel(ctx, t, node, name, deps); err != nil {
+		if err := registerEmbeddedTunnel(ctx, t, node, name, deps, showSetupKey); err != nil {
 			return err
 		}
 	} else {
@@ -524,10 +528,14 @@ func nodeLabels(embedded bool) map[string]string {
 // registerEmbeddedTunnel logs the embedded client in once with the setup key
 // from the node's registration command, persists the resulting identity, and
 // shows what Brev's NetBird management handed out.
-func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nodev1.ExternalNode, name string, deps registerDeps) error {
+func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nodev1.ExternalNode, name string, deps registerDeps, showSetupKey bool) error {
 	ci := node.GetConnectivityInfo()
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return errors.New("brev returned no tunnel registration command; run 'brev register --embedded' again to retry")
+	}
+	if showSetupKey {
+		t.Vprintf("  %s\n", t.Yellow("Registration command from Brev (contains the setup key, do not share):"))
+		t.Vprintf("    %s\n", ci.GetRegistrationCommand())
 	}
 	if creds, err := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); err == nil {
 		hostname := creds.Hostname
@@ -608,9 +616,9 @@ func orgMismatchError(reg *DeviceRegistration, intended *entity.Organization) er
 		existing, reg.OrgName, reg.OrgID, intended.Name, intended.ID))
 }
 
-func checkExistingRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration) error {
+func checkExistingRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration, opts registerOpts) error {
 	if reg.Embedded {
-		return checkExistingEmbedded(ctx, t, s, deps, reg)
+		return checkExistingEmbedded(ctx, t, s, deps, reg, opts)
 	}
 	t.Vprint("")
 	t.Vprintf("  This machine is already registered as %s (%s).\n", reg.DisplayName, reg.ExternalNodeID)
@@ -651,7 +659,7 @@ func checkExistingRegistration(ctx context.Context, t *terminal.Terminal, s Regi
 
 // checkExistingEmbedded re-enrolls the embedded tunnel when the registration
 // record survived but the identity under the user's home did not.
-func checkExistingEmbedded(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration) error {
+func checkExistingEmbedded(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, reg *DeviceRegistration, opts registerOpts) error {
 	t.Vprint("")
 	t.Vprintf("  This device is already registered as %s (%s) with the embedded Brev tunnel.\n", reg.DisplayName, reg.ExternalNodeID)
 	if deps.tunnel.IsRegistered() {
@@ -675,7 +683,7 @@ func checkExistingEmbedded(ctx context.Context, t *terminal.Terminal, s Register
 	if node == nil {
 		return errors.New("brev returned no node for this registration; run 'brev deregister' and register again")
 	}
-	if err := registerEmbeddedTunnel(ctx, t, node, reg.DisplayName, deps); err != nil {
+	if err := registerEmbeddedTunnel(ctx, t, node, reg.DisplayName, deps, opts.showSetupKey); err != nil {
 		return err
 	}
 	t.Vprint("  Connect with: brev ssh --netbird <machine>")
@@ -712,7 +720,7 @@ func runSetup(node *nodev1.ExternalNode, t *terminal.Terminal, deps registerDeps
 // resumeRegistration reuses the pending record's device ID. AddNode is
 // idempotent on device_id, so this recovers when AddNode succeeded backend-side
 // but the CLI never confirmed the ExternalNodeID.
-func resumeRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, pending *DeviceRegistration, registrationToken string) error {
+func resumeRegistration(ctx context.Context, t *terminal.Terminal, s RegisterStore, deps registerDeps, pending *DeviceRegistration, opts registerOpts) error {
 	t.Vprint("")
 	t.Vprint(t.White("══════════════════════════════════════════════════"))
 	t.Vprint(t.White("  Resuming incomplete registration"))
@@ -725,5 +733,5 @@ func resumeRegistration(ctx context.Context, t *terminal.Terminal, s RegisterSto
 	t.Vprint("  A previous registration attempt did not finish. Resuming.")
 
 	org := &entity.Organization{ID: pending.OrgID, Name: pending.OrgName}
-	return runRegisterSteps(ctx, t, s, pending.DisplayName, org, deps, pending.DeviceID, registrationToken, pending.Embedded)
+	return runRegisterSteps(ctx, t, s, pending.DisplayName, org, deps, pending.DeviceID, opts.registrationToken, pending.Embedded, opts.showSetupKey)
 }

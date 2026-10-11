@@ -14,9 +14,14 @@ import (
 	"syscall"
 	"time"
 
+	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
+	"connectrpc.com/connect"
 	"github.com/spf13/cobra"
 
+	"github.com/brevdev/brev-cli/pkg/cmd/register"
+	"github.com/brevdev/brev-cli/pkg/config"
 	breverrors "github.com/brevdev/brev-cli/pkg/errors"
+	"github.com/brevdev/brev-cli/pkg/externalnode"
 	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 )
 
@@ -26,8 +31,9 @@ const (
 	refresh      = 3 * time.Second
 )
 
-// NewCmdTunnel returns the `brev tunnel` command group.
-func NewCmdTunnel() *cobra.Command {
+// NewCmdTunnel returns the `brev tunnel` command group. store authenticates
+// the Brev API calls some subcommands make.
+func NewCmdTunnel(store externalnode.TokenProvider) *cobra.Command {
 	cmd := &cobra.Command{
 		Annotations:           map[string]string{"configuration": ""},
 		Use:                   "tunnel",
@@ -42,10 +48,55 @@ together with the peers in its network map and their connection state.`,
   brev tunnel status
 
   # Stay connected for five minutes so the device shows up as connected in Brev
-  brev tunnel status --keep 5m`,
+  brev tunnel status --keep 5m
+
+  # Print the 'netbird up' command Brev issued for this device (includes the setup key)
+  brev tunnel registration-command`,
 	}
 	cmd.AddCommand(newCmdStatus())
+	cmd.AddCommand(newCmdRegistrationCommand(store))
 	return cmd
+}
+
+func newCmdRegistrationCommand(store externalnode.TokenProvider) *cobra.Command {
+	return &cobra.Command{
+		Annotations:           map[string]string{"configuration": ""},
+		Use:                   "registration-command",
+		DisableFlagsInUseLine: true,
+		Short:                 "Print the 'netbird up' command Brev issued for this device, setup key included",
+		Long: `Fetches the registration command Brev's API currently returns for the node this
+device registered as with 'brev register --embedded'. It contains the setup key,
+so treat the output as a secret. Useful to run the native netbird client with the
+same credentials when comparing it with the embedded one.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRegistrationCommand(cmd.Context(), store)
+		},
+	}
+}
+
+func runRegistrationCommand(ctx context.Context, store externalnode.TokenProvider) error {
+	reg, err := register.NewUserRegistrationStore().LoadAll()
+	if err != nil {
+		return breverrors.NewValidationError(fmt.Sprintf("no embedded registration on this device: %v", err))
+	}
+	client := register.NewNodeServiceClient(store, config.GlobalConfig.GetBrevPublicAPIURL())
+	resp, err := client.GetNode(ctx, connect.NewRequest(&nodev1.GetNodeRequest{
+		ExternalNodeId: reg.ExternalNodeID,
+	}))
+	if err != nil {
+		return fmt.Errorf("fetch node %s: %w", reg.ExternalNodeID, err)
+	}
+	ci := resp.Msg.GetExternalNode().GetConnectivityInfo()
+	if ci == nil || ci.GetRegistrationCommand() == "" {
+		return breverrors.NewValidationError(fmt.Sprintf("Brev returned no registration command for node %s", reg.ExternalNodeID))
+	}
+	fmt.Fprintf(os.Stderr, "Node %s (%s); the command below contains the setup key, do not share it.\n", reg.DisplayName, reg.ExternalNodeID)
+	fmt.Fprintln(os.Stdout, ci.GetRegistrationCommand())
+	if creds, perr := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); perr == nil {
+		fmt.Fprintf(os.Stderr, "Setup key: %s\nManagement: %s\n", creds.SetupKey, creds.ManagementURL)
+	}
+	return nil
 }
 
 func newCmdStatus() *cobra.Command {

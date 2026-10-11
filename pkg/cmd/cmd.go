@@ -369,7 +369,7 @@ func createCmdTree(cmd *cobra.Command, t *terminal.Terminal, loginCmdStore *stor
 	cmd.AddCommand(status.NewCmdStatus(t, loginCmdStore))
 	cmd.AddCommand(sshkeys.NewCmdSSHKeys(t, loginCmdStore))
 	cmd.AddCommand(nbproxy.NewCmdNBProxy())
-	cmd.AddCommand(tunnel.NewCmdTunnel())
+	cmd.AddCommand(tunnel.NewCmdTunnel(loginCmdStore))
 	cmd.AddCommand(start.NewCmdStart(t, loginCmdStore, noLoginCmdStore))
 	cmd.AddCommand(stop.NewCmdStop(t, loginCmdStore, noLoginCmdStore))
 	cmd.AddCommand(delete.NewCmdDelete(t, loginCmdStore, noLoginCmdStore))
