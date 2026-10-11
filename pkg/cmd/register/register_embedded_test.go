@@ -31,6 +31,7 @@ func (m *mockEmbeddedTunnel) Register(_ context.Context, deviceName, registratio
 }
 
 func (m *mockEmbeddedTunnel) IsRegistered() bool { return m.registered }
+func (m *mockEmbeddedTunnel) LogPath() string    { return "/tmp/tunnel.log" }
 
 // refusingGater fails the test if the sudo gate is consulted at all.
 type refusingGater struct{}

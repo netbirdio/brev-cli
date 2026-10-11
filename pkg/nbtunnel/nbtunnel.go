@@ -44,6 +44,9 @@ const (
 	peerPoll     = time.Second
 
 	envDisableNATMapper = "NB_DISABLE_NAT_MAPPER"
+	// EnvLogLevel overrides the embedded client's log level (default debug).
+	EnvLogLevel     = "BREV_NETBIRD_LOG_LEVEL"
+	defaultLogLevel = "debug"
 )
 
 var (
@@ -79,6 +82,11 @@ type Identity struct {
 	DeviceName    string `json:"device_name"`
 	ManagementURL string `json:"management_url"`
 	RegisteredAt  string `json:"registered_at"`
+}
+
+// LogPath returns the embedded client's log file under dir.
+func LogPath(dir string) string {
+	return filepath.Join(dir, logFile)
 }
 
 // IsRegistered reports whether dir holds a usable identity.
@@ -425,7 +433,7 @@ func newClient(dir string, o clientOptions, logW io.Writer) (*netbird.Client, er
 		ConfigPath:            filepath.Join(dir, configFile),
 		StatePath:             filepath.Join(dir, stateFile),
 		LogOutput:             logW,
-		LogLevel:              "warn",
+		LogLevel:              logLevel(),
 		BlockInbound:          true,
 		DisableClientRoutes:   true,
 		LazyConnectionEnabled: &lazy,
@@ -435,6 +443,13 @@ func newClient(dir string, o clientOptions, logW io.Writer) (*netbird.Client, er
 		return nil, fmt.Errorf("create embedded netbird client: %w", err)
 	}
 	return client, nil
+}
+
+func logLevel() string {
+	if level := os.Getenv(EnvLogLevel); level != "" {
+		return level
+	}
+	return defaultLogLevel
 }
 
 // checkManagementURL refuses to run when a NetBird MDM policy on this machine
