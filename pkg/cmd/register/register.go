@@ -541,23 +541,11 @@ func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nod
 	if ci == nil || ci.GetRegistrationCommand() == "" {
 		return errors.New("brev returned no tunnel registration command; run 'brev register --embedded' again to retry")
 	}
-	// The setup key now also unlocks the sealed identity, so only its
-	// fingerprint is shown here; 'brev tunnel registration-command' prints it.
-	if creds, err := nbtunnel.ParseRegistrationCommand(ci.GetRegistrationCommand()); err == nil {
-		hostname := creds.Hostname
-		if hostname == "" {
-			hostname = name
-		}
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Node:")), node.GetExternalNodeId())
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Setup key:")), creds.KeyFingerprint())
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Management:")), creds.ManagementURL)
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Hostname:")), hostname)
-		t.Vprintf("  %s %s (netbird %s), %s\n", t.Green(fmt.Sprintf("%-14s", "Client:")), "embedded", nbtunnel.ClientVersion(), time.Now().UTC().Format(time.RFC3339))
-	}
-	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Log:")), deps.tunnel.LogPath())
+	// What management handed out is in 'brev tunnel status'; the setup key
+	// also unlocks the sealed identity and is never shown here.
 	st, err := deps.tunnel.Register(ctx, node.GetExternalNodeId(), name, ci.GetRegistrationCommand())
 	if err != nil {
-		return fmt.Errorf("embedded Brev tunnel setup failed (run 'brev register --embedded' again to retry): %w", err)
+		return fmt.Errorf("embedded Brev tunnel setup failed (run 'brev register --embedded' again to retry; details in %s): %w", deps.tunnel.LogPath(), err)
 	}
 	if !st.Joined() {
 		t.Vprintf("  %s\n", t.Yellow("Warning: the peer registered but received no NetBird address yet: "+st.ManagementError))
@@ -566,12 +554,6 @@ func registerEmbeddedTunnel(ctx context.Context, t *terminal.Terminal, node *nod
 	}
 	t.Vprintf("%s  Embedded Brev tunnel ready.\n", t.Green("  ✓"))
 	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "NetBird IP:")), t.BoldBlue(st.IP))
-	if st.FQDN != "" {
-		t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "FQDN:")), t.BoldBlue(st.FQDN))
-	}
-	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Device name:")), t.BoldBlue(st.DeviceName))
-	t.Vprintf("  %s %s\n", t.Green(fmt.Sprintf("%-14s", "Public key:")), t.BoldBlue(st.PubKey))
-	t.Vprintf("  %s %d\n", t.Green(fmt.Sprintf("%-14s", "Peers:")), len(st.Peers))
 	return nil
 }
 

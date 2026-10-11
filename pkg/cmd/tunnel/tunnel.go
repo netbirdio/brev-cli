@@ -7,10 +7,12 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -131,6 +133,18 @@ func runStatus(ctx context.Context, store externalnode.TokenProvider, keep time.
 	fmt.Fprintln(stderr, "Unlocking the tunnel identity with the current Brev session ...")
 	started := time.Now()
 	tunnel, err := Open(ctx, store, dir)
+	if errors.Is(err, nbtunnel.ErrLocked) {
+		// A previous 'brev ssh --netbird' session's master keeps its engine,
+		// and the identity lock, up for a while after the session ends.
+		stopped, rerr := nbtunnel.ReleaseIdleMasters(ctx, dir)
+		if rerr != nil {
+			return breverrors.NewValidationError(rerr.Error())
+		}
+		if len(stopped) > 0 {
+			fmt.Fprintf(stderr, "Stopped the idle tunnel of a previous session (%s).\n", strings.Join(stopped, ", "))
+		}
+		tunnel, err = Open(ctx, store, dir)
+	}
 	if err != nil {
 		return breverrors.NewValidationError(err.Error())
 	}

@@ -2,8 +2,10 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 
 	nodev1connect "buf.build/gen/go/brevdev/devplane/connectrpc/go/devplaneapi/v1/devplaneapiv1connect"
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
@@ -18,6 +20,68 @@ import (
 // ErrNotLoggedIn means no Brev session is available to fetch the key that
 // unlocks the tunnel identity.
 var ErrNotLoggedIn = errors.New("not logged in to Brev; run 'brev login' to use the embedded Brev tunnel")
+
+// EnvUnlock names a one-shot file through which 'brev ssh --netbird' hands
+// the unlock credentials to the nb-proxy that ssh spawns for it, so the proxy
+// does not repeat the Brev API call the parent just made. Only the path
+// travels through ssh's environment; nb-proxy deletes the file as it reads
+// it and the parent deletes it after ssh exits, whichever comes first.
+const EnvUnlock = "BREV_NB_UNLOCK"
+
+// StashCredentials writes creds to a private one-shot file under dir and
+// returns its path, for EnvUnlock.
+func StashCredentials(dir string, creds nbtunnel.Credentials) (string, error) {
+	data, err := json.Marshal(creds)
+	if err != nil {
+		return "", fmt.Errorf("encode unlock credentials: %w", err)
+	}
+	f, err := os.CreateTemp(dir, "unlock-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create unlock file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", fmt.Errorf("write unlock file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", fmt.Errorf("write unlock file: %w", err)
+	}
+	return f.Name(), nil
+}
+
+// RemoveStash deletes a file StashCredentials created; a file nb-proxy
+// already consumed is fine.
+func RemoveStash(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "warning: remove %s: %v\n", path, err)
+	}
+}
+
+// CredentialsFromEnv reads and deletes the file a parent brev ssh named in
+// EnvUnlock, clearing the variable; ok is false when there is none.
+func CredentialsFromEnv() (creds nbtunnel.Credentials, ok bool, err error) {
+	path := os.Getenv(EnvUnlock)
+	if path == "" {
+		return creds, false, nil
+	}
+	if err := os.Unsetenv(EnvUnlock); err != nil {
+		return creds, false, fmt.Errorf("clear %s: %w", EnvUnlock, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return creds, false, fmt.Errorf("read %s: %w", EnvUnlock, err)
+	}
+	RemoveStash(path)
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return creds, false, fmt.Errorf("parse %s: %w", EnvUnlock, err)
+	}
+	if creds.SetupKey == "" || creds.ManagementURL == "" {
+		return creds, false, fmt.Errorf("%s carries no credentials", EnvUnlock)
+	}
+	return creds, true, nil
+}
 
 // newNodeClient builds the node service client; tests point it at a fake.
 var newNodeClient = func(store externalnode.TokenProvider) nodev1connect.ExternalNodeServiceClient {

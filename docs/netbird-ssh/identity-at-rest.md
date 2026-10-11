@@ -28,6 +28,8 @@ uses: `AddNode` and `GetNode` with the `netbird up --setup-key ...` command in
 | `networkmap.pb` | the last network map the client received, written by the client next to the state file | contains TURN credentials from management |
 | `tunnel.log` | the embedded client's log | no keys; the setup key appears as an 8 character fingerprint |
 | `lock` | the single-engine lock | no |
+| `targets.json` | the machines `brev ssh --netbird` resolved, by ssh alias: name, id, overlay address, port, kind, time | no |
+| `unlock-*.json` | the unlock credentials on their way from `brev ssh --netbird` to `nb-proxy`, deleted as soon as the proxy reads them or ssh exits | setup key, for the life of one ssh start |
 | `device_registration.json` | the Brev registration record | no |
 
 The embedded client runs with an in-memory config (`embed.Options.ConfigPath`
@@ -59,10 +61,28 @@ sealed copy is kept for a client that can take it.
 
 - `brev ssh --netbird` unlocks once in the parent process, while the terminal
   is still its own, so an expired session is reported as a clear message
-  rather than a bare `255` from inside the ProxyCommand. It then runs ssh,
-  whose `brev nb-proxy` ProxyCommand unlocks again with the no-login store:
-  that process must never start an interactive login because its stdio
-  belongs to ssh. A live ControlMaster skips both, as no new engine starts.
+  rather than a bare `255` from inside the ProxyCommand. It then runs ssh and
+  hands the credentials to the `brev nb-proxy` ProxyCommand through a one-shot
+  file under the tunnel directory whose path travels in `BREV_NB_UNLOCK`: only
+  the path is visible to ssh, its children and the detached master, and the
+  file is deleted when the proxy reads it or when ssh exits. Run on its own,
+  nb-proxy fetches the credentials with the no-login store: that process must
+  never start an interactive login because its stdio belongs to ssh.
+- A reconnect while the ssh ControlMaster of a previous session is alive
+  (`ControlPersist` is ten minutes) skips the lookups and the unlock: ssh
+  multiplexes over the running tunnel and never runs the ProxyCommand. The
+  target of each resolved alias is remembered in `targets.json` for that path.
+  A live master only proves the master process is up, so reuse without asking
+  Brev is bounded: an entry older than ten minutes goes through the Brev lookup
+  again (the master is still reused, no engine restarts), and a lookup Brev now
+  refuses stops the lingering master.
+- The master's nb-proxy holds the identity lock for as long as the master
+  lives, so a connection to another machine, or `brev tunnel status`, within
+  those ten minutes stops the idle master first (`ssh -O stop`) and waits for
+  the lock; a master that still carries an open session keeps it, and the
+  error names it.
+- `BREV_NETBIRD_TIMING=1` prints the per-phase timing of both processes; the
+  breakdown is always written to `tunnel.log`.
 - `brev tunnel status` unlocks with the login store, so an expired session
   prompts for a login first.
 - `brev register --embedded` seals; `brev deregister` removes the node and the

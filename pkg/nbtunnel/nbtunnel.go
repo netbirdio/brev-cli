@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,13 +46,33 @@ const (
 	startGrace   = 15 * time.Second
 	joinTimeout  = 30 * time.Second
 	stopTimeout  = 5 * time.Second
-	peerPoll     = time.Second
+	// peerPoll bounds how late a peer that just connected is noticed; the
+	// status call it drives is a local map read.
+	peerPoll = 200 * time.Millisecond
 
 	envDisableNATMapper = "NB_DISABLE_NAT_MAPPER"
 	// EnvLogLevel overrides the embedded client's log level (default debug).
 	EnvLogLevel     = "BREV_NETBIRD_LOG_LEVEL"
 	defaultLogLevel = "debug"
+	// EnvTiming turns on the per-phase timing lines of 'brev ssh --netbird'
+	// and nb-proxy on the terminal; the breakdown always goes to the log.
+	EnvTiming = "BREV_NETBIRD_TIMING"
 )
+
+// TimingEnabled reports whether EnvTiming asks for timing lines on the
+// terminal. An unparseable value counts as off and is logged.
+func TimingEnabled() bool {
+	val := os.Getenv(EnvTiming)
+	if val == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(val)
+	if err != nil {
+		logrus.Debugf("failed to parse %s: %v", EnvTiming, err)
+		return false
+	}
+	return on
+}
 
 var (
 	// ErrNotRegistered means no embedded tunnel identity exists on this device.

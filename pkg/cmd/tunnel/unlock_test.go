@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -95,6 +96,47 @@ func TestCredentialsNamesTheRemedyForAGoneNode(t *testing.T) {
 	}})
 	if _, err := Credentials(context.Background(), tokenStub{}, testIdentity); !errors.Is(err, ErrNotLoggedIn) {
 		t.Errorf("an unauthenticated GetNode should read as not logged in, got %v", err)
+	}
+}
+
+func TestCredentialsStashRoundTrip(t *testing.T) {
+	t.Setenv(EnvUnlock, "")
+	if _, ok, err := CredentialsFromEnv(); ok || err != nil {
+		t.Fatalf("no variable: ok=%v err=%v, want neither", ok, err)
+	}
+	dir := t.TempDir()
+	want := nbtunnel.Credentials{SetupKey: "7F3A2C19-5B6E-4D80-9A1C-2E4F6B8D0C13", ManagementURL: "https://m.example.com", Hostname: "laptop"}
+	path, err := StashCredentials(dir, want)
+	if err != nil {
+		t.Fatalf("StashCredentials: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat stash: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("stash mode = %o, want 0600", info.Mode().Perm())
+	}
+	t.Setenv(EnvUnlock, path)
+	got, ok, err := CredentialsFromEnv()
+	if err != nil || !ok {
+		t.Fatalf("CredentialsFromEnv: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Errorf("credentials = %+v, want %+v", got, want)
+	}
+	if v := os.Getenv(EnvUnlock); v != "" {
+		t.Errorf("%s must be cleared after reading, still %q", EnvUnlock, v)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the stash must be deleted once read")
+	}
+	// The parent's cleanup after ssh must not mind the file being gone.
+	RemoveStash(path)
+
+	t.Setenv(EnvUnlock, path)
+	if _, _, err := CredentialsFromEnv(); err == nil {
+		t.Error("a missing stash must be an error, not a silent cold path")
 	}
 }
 

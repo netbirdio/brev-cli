@@ -77,15 +77,15 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 	if err != nil {
 		return fmt.Errorf("user home dir: %w", err)
 	}
-	progressf(stderr, "[%s] unlocking the Brev tunnel identity", clock)
-	tunnel, err := tunnelcmd.Open(ctx, store, nbtunnel.Dir(home))
+	progressf(stderr, "%sunlocking the Brev tunnel identity", clock.stamp())
+	tunnel, err := openTunnel(ctx, store, nbtunnel.Dir(home))
 	if err != nil {
 		return err //nolint:wrapcheck // the tunnel errors already name the remedy
 	}
 	defer tunnel.Close()
 	unlock := clock.lap()
 
-	progressf(stderr, "[%s] starting the Brev tunnel", clock)
+	progressf(stderr, "%sstarting the Brev tunnel", clock.stamp())
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	err = tunnel.Start(startCtx)
 	cancel()
@@ -97,7 +97,7 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 	link := "unknown"
 	var peerWait time.Duration
 	if addr, perr := netip.ParseAddr(host); perr == nil {
-		progressf(stderr, "[%s] waiting for %s to connect over NetBird", clock, host)
+		progressf(stderr, "%swaiting for %s to connect over NetBird", clock.stamp(), host)
 		waitCtx, cancel := context.WithTimeout(ctx, peerTimeout)
 		err = tunnel.WaitForPeer(waitCtx, addr)
 		cancel()
@@ -111,7 +111,9 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 				link += fmt.Sprintf(", latency %s", p.Latency.Round(time.Millisecond))
 			}
 		}
-		progressf(stderr, "[%s] peer %s connected via %s", clock, host, link)
+		if clock.timing {
+			progressf(stderr, "%speer %s connected via %s", clock.stamp(), host, link)
+		}
 	}
 
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
@@ -124,30 +126,56 @@ func run(ctx context.Context, store externalnode.TokenProvider, host string, por
 	dial := clock.lap()
 	summary := fmt.Sprintf("connected to %s over NetBird after %s (unlock %s, engine start %s, peer connect %s via %s, dial %s)",
 		target, clock, fmtDur(unlock), fmtDur(engine), fmtDur(peerWait), link, fmtDur(dial))
-	progressf(stderr, "[%s] %s", clock, summary)
-	// os.Stderr is the tunnel log while the engine runs; keep the breakdown
-	// there too, next to the engine's own timestamps.
+	// os.Stderr is the tunnel log while the engine runs; the breakdown always
+	// lands there, next to the engine's own timestamps.
 	progressf(os.Stderr, "timing: %s", summary)
-
+	if !clock.timing {
+		progressf(stderr, "connected to %s over NetBird", target)
+		netrelay.Relay(ctx, newStdioConn(), conn, netrelay.Options{})
+		return nil
+	}
+	progressf(stderr, "%s%s", clock.stamp(), summary)
 	// The first bytes back are sshd's banner: from here on the overlay path
 	// carries the session and what remains is the ssh handshake itself.
 	remote := &firstByteConn{Conn: conn, onFirst: func(n int) {
-		progressf(stderr, "[%s] first %d bytes from %s (sshd banner); the ssh handshake runs from here", clock, n, target)
+		progressf(stderr, "%sfirst %d bytes from %s (sshd banner); the ssh handshake runs from here", clock.stamp(), n, target)
 	}}
 	netrelay.Relay(ctx, newStdioConn(), remote, netrelay.Options{})
 	return nil
 }
 
-// stopwatch stamps progress lines with the time since nb-proxy started and
-// measures the laps between the connection phases.
+// openTunnel unlocks the identity with the credentials the parent brev ssh
+// left in the environment, or fetches them itself when nb-proxy runs alone.
+func openTunnel(ctx context.Context, store externalnode.TokenProvider, dir string) (*nbtunnel.Tunnel, error) {
+	creds, ok, err := tunnelcmd.CredentialsFromEnv()
+	if err != nil {
+		return nil, err //nolint:wrapcheck // names the variable already
+	}
+	if ok {
+		return nbtunnel.Open(dir, creds) //nolint:wrapcheck // names the remedy already
+	}
+	return tunnelcmd.Open(ctx, store, dir) //nolint:wrapcheck // names the remedy already
+}
+
+// stopwatch measures the laps between the connection phases and, when the
+// user asked for timing, stamps progress lines with the time since start.
 type stopwatch struct {
-	start time.Time
-	last  time.Time
+	start  time.Time
+	last   time.Time
+	timing bool
 }
 
 func newStopwatch() *stopwatch {
 	now := time.Now()
-	return &stopwatch{start: now, last: now}
+	return &stopwatch{start: now, last: now, timing: nbtunnel.TimingEnabled()}
+}
+
+// stamp is the "[+1.20s] " prefix of a progress line, or nothing.
+func (s *stopwatch) stamp() string {
+	if !s.timing {
+		return ""
+	}
+	return "[" + s.String() + "] "
 }
 
 // lap returns the time since the previous lap (or the start).

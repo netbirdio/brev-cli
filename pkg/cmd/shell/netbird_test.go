@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	nodev1 "buf.build/gen/go/brevdev/devplane/protocolbuffers/go/devplaneapi/v1"
+
+	"github.com/brevdev/brev-cli/pkg/nbtunnel"
 )
 
 func TestNetbirdSSHOptions(t *testing.T) {
@@ -18,8 +20,8 @@ func TestNetbirdSSHOptions(t *testing.T) {
 		"-o", "ProxyJump=none",
 		"-o", "ConnectTimeout=90",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=~/.brev/nb-control-%C",
-		"-o", "ControlPersist=30s",
+		"-o", "ControlPath=" + nbtunnel.ControlPath,
+		"-o", "ControlPersist=" + nbtunnel.ControlPersist,
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 	}
